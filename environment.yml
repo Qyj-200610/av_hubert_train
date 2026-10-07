@@ -1,0 +1,68 @@
+# AV-HuBERT (LRS2 复现) conda 环境 —— Linux + NVIDIA GPU
+#
+# 版本选择说明（重要，踩坑点）：
+#   * fairseq 仓库被 pin 在 2021-06-15 的 commit afc77bd，它只兼容
+#     Python 3.8–3.10，且必须用 numpy 1.x（numpy 2.x 会导致 C++ 扩展编译失败）。
+#   * torch 1.13.1 + CUDA 11.7 是该 commit 时代最好装、且官方验证过的组合。
+#   * opencv 不能按 av_hubert/requirements.txt 里的 4.5.4.60 装（无 py3.9 wheel），
+#     因此固定到 4.9.0.80，API 兼容。
+#   * scipy 相应从 1.10.0 提到 1.10.1（py3.9 有 wheel），语义无变化。
+#
+# 创建：
+#   conda env create -f environment.yml
+#   conda activate avhubert
+#   bash scripts/setup_env.sh          # 编译 fairseq 扩展 + 安装 avhubert
+#
+# 若你的服务器 CUDA 是 12.x，conda 里的 cudatoolkit=11.7 仍然可用
+# （PyTorch 自带 CUDA 运行时，只要驱动版本 >= 对应要求即可）。
+
+name: avhubert
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ---- Python 与基础科学计算 ----
+  - python=3.9
+  - pip
+  - numpy=1.24.4          # ★ 必须 1.x
+  - scipy=1.10.1
+  - pandas
+  - tqdm
+  - pyyaml
+  - packaging
+  - scikit-learn
+  - scikit-image
+  - matplotlib
+  - ffmpeg=4.4            # 数据预处理需要；若服务器已有系统 ffmpeg 可删掉这行
+  - cmake
+  - make
+  - gcc_linux-64=11
+  - gxx_linux-64=11
+  - libsndfile
+
+  # ---- PyTorch ----
+  - pytorch=1.13.1
+  - torchaudio=0.13.1
+  - cudatoolkit=11.7
+
+  # ---- pip 依赖 ----
+  - pip:
+      - python-speech-features==0.6
+      - opencv-python==4.9.0.80
+      - sentencepiece==0.1.96
+      - editdistance==0.6.0
+      # ---- 数据预处理（avhubert/preparation/requirements.txt）----
+      - pydub==0.25.1
+      - dlib==19.24.2
+      - scikit-video==1.1.11
+      - submitit==1.4.1
+      # ---- 聚类（仅在需要自己跑 k-means 时用）----
+      - soundfile
+      - joblib
+      - npy-append-array==0.9.13
+      # ---- 评测 ----
+      - jiwer==3.0.3

@@ -1,0 +1,68 @@
+# =============================================================================
+# AV-HuBERT LRS2 复现项目 .gitignore
+#
+# ★ 重要约定：数据/产物类目录一律用 **前导斜杠** 锚定到仓库根目录，例如 /data/
+#   不能写成 data/，否则会匹配任意层级的 data 目录，把 fairseq 的核心代码
+#   （fairseq/fairseq/data/*.py）一起忽略掉。
+#
+# ★ 本项目需要上传代码：所有 .py / .sh / .yaml / .md 一律不忽略。
+# =============================================================================
+
+# ---- 数据集与预处理产物（体积大，只忽略根目录下的）----
+/data/
+/lrs2_data/
+/audio/
+/video/
+/landmark/
+/spm*/
+/nframes.*
+/missing.list.*
+*.wav
+*.mp4
+*.pkl
+
+# ---- 预训练权重与实验产物 ----
+/pretrained/*.pt
+/exp/
+/tblog/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# ---- Python：只忽略缓存与构建产物，绝不忽略源码 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+/build/
+/dist/
+/.venv/
+/venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# 保险措施：显式声明「代码文件永不忽略」
+# 即使上面的规则将来被误改，这几行也能兜住。
+# =============================================================================
+!*.py
+!*.sh
+!*.yaml
+!*.yml
+!*.md
+!*.txt
+!*.json
+!*.cfg
+!*.toml
+!*.ini
+!.gitignore
+!.gitmodules
