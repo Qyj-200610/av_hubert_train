@@ -40,18 +40,90 @@ CNN_DETECTOR="${DLIB}/mmod_human_face_detector.dat"
 FACE_PREDICTOR="${DLIB}/shape_predictor_68_face_landmarks.dat"
 MEAN_FACE="${DLIB}/20words_mean_face.npy"
 
+# =============================================================================
+# 前置检查 1：不要把数据放在根分区（恒源云 / AutoDL 等平台的常见坑）
+#   恒源云实例的根分区 / 通常只有约 20G 可用，而 /hy-tmp 才是大容量高速盘。
+#   若把 WORK 设成 /root/... 会在抽取唇部 ROI 时把磁盘写满，
+#   而且失败信息往往很难看出是磁盘问题。
+# =============================================================================
+check_disk_space() {
+  local target="$1"
+  local avail_gb
+  avail_gb=$(df -BG --output=avail "${target}" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [[ -z "${avail_gb}" ]]; then
+    echo "警告：无法读取 ${target} 的可用空间，跳过检查"
+    return 0
+  fi
+
+  echo "可用空间检查：${target} 剩余 ${avail_gb} GB"
+
+  # 根分区且剩余不足 30G -> 大概率会中途写满
+  if [[ "${avail_gb}" -lt 30 ]]; then
+    case "${target}" in
+      /root*|/|/root)
+        cat >&2 <<EOF
+
+=============================================================================
+错误：WORK 落在根分区且只剩 ${avail_gb} GB。
+
+这是云平台最常见的坑：实例根分区一般只有约 20G，装不下预处理产物。
+请把 WORK 改到大容量盘，例如恒源云的 /hy-tmp：
+
+    export WORK=/hy-tmp/lrs2_data
+    export DLIB=/hy-tmp/dlib
+
+并把数据集也放在 /hy-tmp 下，例如：
+
+    export LRS2_ROOT=/hy-tmp/main
+    export DATALIST=/hy-tmp/lrs2_datalist
+
+（恒源云：/hy-tmp 是实例本地高速盘，关机 24 小时后会被清空，
+  重要结果请及时用 oss cp 传到「个人数据」。）
+=============================================================================
+EOF
+        exit 1
+        ;;
+    esac
+    echo "警告：可用空间仅 ${avail_gb} GB，预处理产物可能装不下，请留意" >&2
+  fi
+}
+
+# 前置检查 2：大容量盘提示（恒源云特有）
+if [[ -d /hy-tmp ]]; then
+  hy_gb=$(df -BG --output=avail /hy-tmp 2>/dev/null | tail -1 | tr -dc '0-9')
+  echo "检测到恒源云实例：/hy-tmp 剩余 ${hy_gb:-未知} GB"
+  case "${WORK}" in
+    /hy-tmp/*) : ;;
+    *) echo "提示：建议把 WORK 放在 /hy-tmp 下（当前为 ${WORK}）" >&2 ;;
+  esac
+fi
+
 mkdir -p "${WORK}"
+check_disk_space "${WORK}"
 
 log() { echo -e "\n\033[1;36m==== $* ====\033[0m"; }
 
 # ---------- 1. 数据列表 -> file.list / label.list ----------
 step_prepare() {
-  log "step 1/6  解析划分列表，生成 file.list / label.list"
+  log "step 1/6  解析划分列表，生成 file.list / label.list / split.list"
+  # 布局：本考核从 AI Studio 下载的 main 实测为 flat
+  #       （main/<video_id>/<clip_id>.mp4，无 train/val/test 子目录）
+  #
+  # LIMIT>0 时只取每个划分的前 N 条（用于先用小样本验证全流程，再跑全量）
+  local limit_args=()
+  if [[ -n "${LIMIT:-}" && "${LIMIT}" -gt 0 ]]; then
+    limit_args=(--max-train "${LIMIT}" --max-valid "${LIMIT}" --max-test "${LIMIT}")
+    echo "注意：LIMIT=${LIMIT}，只取每个划分前 ${LIMIT} 条做验证"
+  fi
+
   python "${PREP}/lrs2_prepare.py" \
     --lrs2-root "${LRS2_ROOT}" \
     --datalist  "${DATALIST}" \
-    --work-dir  "${WORK}"
+    --work-dir  "${WORK}" \
+    --layout    "${LAYOUT:-flat}" \
+    "${limit_args[@]}"
   echo "总条数: $(wc -l < "${WORK}/file.list")"
+  echo "fid 样例: $(head -1 "${WORK}/file.list")"
 }
 
 # ---------- 2. 抽取音频（wav, 16kHz 单声道）----------
@@ -70,7 +142,7 @@ n = math.ceil(len(fids) / nshard)
 shard = fids[rank*n:(rank+1)*n]
 print(f"rank {rank}/{nshard}: {len(shard)} clips")
 for fid in tqdm(shard):
-    # fid 的前缀就是 LRS2 main 下的真实目录名（train/val/test），可直接拼路径
+    # fid 与实际目录结构一致（flat 布局下即 <video_id>/<clip_id>），可直接拼路径
     src = os.path.join(lrs2_root, fid + '.mp4')
     dst = os.path.join(work, 'audio', fid + '.wav')
     os.makedirs(os.path.dirname(dst), exist_ok=True)

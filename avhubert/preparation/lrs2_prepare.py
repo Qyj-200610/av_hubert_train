@@ -45,15 +45,47 @@ import os
 import sys
 from collections import OrderedDict
 
-# 划分列表文件名 -> LRS2 main 下的真实目录名
+# 划分列表文件名
 SPLITS = ("train", "val", "test")
-# ★ fid 前缀必须用 **真实目录名**（train/val/test），不能改成 valid。
-#   原因：官方的 detect_landmark.py 与 align_mouth.py 都会按
-#       os.path.join(root, fid + '.mp4')
-#   去拼路径，所以 file.list 的前缀必须和 LRS2 main 下的目录名逐字一致，
-#   否则会报 "File does not exist"。
-#   fairseq 需要的 valid.tsv/valid.wrd 由 lrs2_manifest.py 负责改名产出，
-#   与 fid 前缀无关。
+
+# ---------------------------------------------------------------------------
+# 两种数据布局（实测：本考核从 AI Studio 下载的 main 是 "flat"）
+#
+#   flat  : main/<video_id>/<clip_id>.mp4          （共 3783 个 video_id 目录）
+#           实测与 datalist 完全对应：视频 ID 就是顶层目录名。
+#   split : main/<split>/<video_id>/<clip_id>.mp4  （部分 LRS2 打包方式）
+#
+# 为什么要做成选项：官方的 detect_landmark.py / align_mouth.py 都按
+#     os.path.join(root, fid + '.mp4')
+# 拼路径，所以 file.list 里的 fid 必须与实际目录结构逐字一致，否则会报
+# "File does not exist"。这里按布局生成对应的 fid。
+#   flat  -> fid = "<video_id>/<clip_id>"
+#   split -> fid = "<split>/<video_id>/<clip_id>"
+# ---------------------------------------------------------------------------
+
+
+def build_vid2split(datalist_dir):
+    """从三个划分列表建立 video_id -> split 的映射。
+
+    flat 布局下目录里没有划分信息，划分归属只能由 datalist 决定。
+    """
+    vid2split = {}
+    for split in SPLITS:
+        fn = os.path.join(datalist_dir, "%s.txt" % split)
+        if not os.path.isfile(fn):
+            continue
+        with open(fn, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if not parts:
+                    continue
+                vid = parts[0].split("/")[0]
+                if vid in vid2split and vid2split[vid] != split:
+                    # 同一个 video_id 跨划分出现（LRS2 里确实可能），标为冲突
+                    vid2split[vid] = "__conflict__"
+                else:
+                    vid2split.setdefault(vid, split)
+    return vid2split
 
 
 def read_list(path):
@@ -74,23 +106,27 @@ def read_list(path):
     return items
 
 
-def find_label_file(lrs2_root, split_dir, fid):
-    """在 LRS2 main 里定位某个 clip 的标注文件。
+def label_file_of(lrs2_root, layout, split, fid):
+    """按布局返回 clip 标注文件（<clip>.txt）的路径。
 
-    LRS2 的目录结构大致是：
-        main/<split>/<video_id>/<clip_id>.mp4
-        main/<split>/<video_id>/<clip_id>.txt
-    这里对几种常见结构都做尝试。
+    - flat : main/<fid>.txt，其中 fid = <video_id>/<clip_id>
+    - split: main/<split>/<fid>.txt
+    两种布局下 <clip>.txt 都与 <clip>.mp4 同目录同名，故直接替换后缀。
     """
-    candidates = [
-        os.path.join(lrs2_root, split_dir, fid + ".txt"),
-        os.path.join(lrs2_root, split_dir, os.path.basename(os.path.dirname(fid)),
-                     os.path.basename(fid) + ".txt"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
+    if layout == "split":
+        base = os.path.join(lrs2_root, split, fid)
+    else:
+        base = os.path.join(lrs2_root, fid)
+    return base + ".txt"
+
+
+def media_file_of(lrs2_root, layout, split, fid):
+    """按布局返回 clip 视频文件（<clip>.mp4）的路径。"""
+    if layout == "split":
+        base = os.path.join(lrs2_root, split, fid)
+    else:
+        base = os.path.join(lrs2_root, fid)
+    return base + ".mp4"
 
 
 def parse_label(txt_path):
@@ -134,23 +170,35 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--lrs2-root", required=True,
-                    help="LRS2 main 数据集根目录（其下应有 train/ val/ test/ 三个子目录）")
+                    help="LRS2 main 数据集根目录（应指向 main 目录本身）")
     ap.add_argument("--datalist", required=True,
                     help="招新题目提供的划分列表目录（含 train.txt/val.txt/test.txt）")
     ap.add_argument("--work-dir", required=True,
                     help="输出工作目录（file.list/label.list/audio/video/landmark 都放这里）")
+    ap.add_argument("--layout", choices=("flat", "split"), default="flat",
+                    help="目录布局。flat: main/<video_id>/<clip>.mp4（本考核实测即为该布局）；"
+                         "split: main/<split>/<video_id>/<clip>.mp4")
     ap.add_argument("--copy-video-to", default=None,
                     help="可选：把原始 mp4 按 fid 结构复制/硬链接到该目录（默认不复制，直接用原路径）")
     ap.add_argument("--link", action="store_true",
                     help="配合 --copy-video-to 使用硬链接而非复制（同一文件系统时省空间）")
     ap.add_argument("--split-prefix", action="store_true", default=True,
-                    help="fid 前加划分前缀（train/val/test，与 LRS2 真实目录名一致），默认开启")
+                    help="仅 split 布局生效：fid 前加划分前缀（train/val/test）")
     ap.add_argument("--no-split-prefix", dest="split_prefix", action="store_false")
     ap.add_argument("--strict", action="store_true", default=True,
                     help="只要有 clip 缺标注就报错退出（默认开启）")
     ap.add_argument("--allow-missing", dest="strict", action="store_false",
                     help="允许跳过缺标注的 clip（会打印警告）")
+    # 小样本验证用：只取每个划分的前 N 条
+    ap.add_argument("--max-train", type=int, default=None,
+                    help="train 划分最多取多少条（用于小样本验证全流程）")
+    ap.add_argument("--max-valid", type=int, default=None,
+                    help="val 划分最多取多少条")
+    ap.add_argument("--max-test", type=int, default=None,
+                    help="test 划分最多取多少条")
     args = ap.parse_args()
+
+    limit_map = {"train": args.max_train, "val": args.max_valid, "test": args.max_test}
 
     # ---------- 检查输入 ----------
     if not os.path.isdir(args.lrs2_root):
@@ -160,7 +208,14 @@ def main():
 
     os.makedirs(args.work_dir, exist_ok=True)
 
-    fids_all, labels_all = [], []
+    # flat 布局下目录里没有划分信息，先建立 video_id -> split 映射
+    vid2split = build_vid2split(args.datalist) if args.layout == "flat" else {}
+    if args.layout == "flat":
+        n_conf = sum(1 for v in vid2split.values() if v == "__conflict__")
+        print("布局=flat，从 datalist 建立 video_id->split 映射：%d 个 video_id%s"
+              % (len(vid2split), ("，其中 %d 个跨划分冲突" % n_conf) if n_conf else ""))
+
+    fids_all, labels_all, splits_all = [], [], []
     stats = OrderedDict()
 
     for split in SPLITS:
@@ -169,21 +224,23 @@ def main():
             sys.exit("错误：找不到划分列表 %s" % list_fn)
 
         items = read_list(list_fn)
-        out_prefix = split if args.split_prefix else ""
+        # 小样本验证：只保留前 N 条
+        lim = limit_map.get(split)
+        if lim is not None and lim > 0 and len(items) > lim:
+            print("[%s] 受 --max-%s=%d 限制，从 %d 条中取前 %d 条"
+                  % (split, "valid" if split == "val" else split, lim, len(items), lim))
+            items = items[:lim]
 
         n_ok, n_missing_label, n_missing_media, missing_examples = 0, 0, 0, []
         part_fids, part_labels = [], []
 
         for fid, _extra in items:
-            txt = find_label_file(args.lrs2_root, split, fid)
-            if txt is None:
+            txt = label_file_of(args.lrs2_root, args.layout, split, fid)
+            if not os.path.isfile(txt):
                 n_missing_label += 1
                 if len(missing_examples) < 5:
                     missing_examples.append(fid)
-                if args.strict:
-                    continue
-                else:
-                    continue
+                continue
             try:
                 label = parse_label(txt)
             except Exception as e:
@@ -192,14 +249,15 @@ def main():
                     missing_examples.append("%s (%s)" % (fid, e))
                 continue
 
-            media = os.path.join(args.lrs2_root, split, fid + ".mp4")
+            media = media_file_of(args.lrs2_root, args.layout, split, fid)
             if not os.path.isfile(media):
                 n_missing_media += 1
                 if len(missing_examples) < 5:
                     missing_examples.append(fid + " [mp4 missing]")
                 continue
 
-            out_fid = ("%s/%s" % (out_prefix, fid)) if out_prefix else fid
+            # flat 布局下 fid 就是 <video_id>/<clip_id>，split 归属另行记录
+            out_fid = ("%s/%s" % (split, fid)) if (args.layout == "split" and args.split_prefix) else fid
             part_fids.append(out_fid)
             part_labels.append(label)
             n_ok += 1
@@ -216,6 +274,7 @@ def main():
 
         fids_all.extend(part_fids)
         labels_all.extend(part_labels)
+        splits_all.extend([split] * len(part_fids))
 
     # ---------- 严格模式：有任何缺失就退出 ----------
     total_missing = sum(v["missing_label"] + v["missing_mp4"] for v in stats.values())
@@ -223,9 +282,11 @@ def main():
         print()
         print("=" * 72)
         print("错误：共有 %d 条 clip 找不到标注或 mp4。这通常说明：" % total_missing)
-        print("  1) 数据集没有下载完整（LRS2 main 应包含 train/val/test 三个子目录）；")
-        print("  2) --lrs2-root 指错了层级（应指向 main 目录，而不是它的上级）；")
-        print("  3) 列表里的 clip 与本地数据版本不一致。")
+        print("  1) 数据集还没下载完整（本考核的 main 约 48164 个 clip）；")
+        print("  2) --lrs2-root 指错了层级（应指向 main 目录本身）；")
+        print("  3) 布局判断错了：本数据集实测是 flat（main/<video_id>/<clip>.mp4），")
+        print("     若你的数据是 main/<split>/<video_id>/... 请加 --layout split；")
+        print("  4) 列表里的 clip 与本地数据版本不一致。")
         print("确认无误后，可加 --allow-missing 跳过缺失项继续。")
         print("=" * 72)
         sys.exit(1)
@@ -233,15 +294,21 @@ def main():
     # ---------- 落盘 ----------
     file_list = os.path.join(args.work_dir, "file.list")
     label_list = os.path.join(args.work_dir, "label.list")
+    # 额外产出 split.list：flat 布局下 fid 不带划分前缀，
+    # lrs2_manifest.py 需要靠它来划分 train/valid/test。
+    split_list = os.path.join(args.work_dir, "split.list")
     with open(file_list, "w", encoding="utf-8") as fo:
         fo.write("\n".join(fids_all) + "\n")
     with open(label_list, "w", encoding="utf-8") as fo:
         fo.write("\n".join(labels_all) + "\n")
+    with open(split_list, "w", encoding="utf-8") as fo:
+        fo.write("\n".join(splits_all) + "\n")
 
     summary = OrderedDict(
         lrs2_root=os.path.abspath(args.lrs2_root),
         datalist=os.path.abspath(args.datalist),
         work_dir=os.path.abspath(args.work_dir),
+        layout=args.layout,
         split_prefix=args.split_prefix,
         total=len(fids_all),
         per_split=stats,
@@ -253,7 +320,10 @@ def main():
     print("完成：共 %d 条" % len(fids_all))
     print("  fid  列表 -> %s" % file_list)
     print("  文本 列表 -> %s" % label_list)
+    print("  划分 列表 -> %s" % split_list)
     print("  统计信息  -> %s" % os.path.join(args.work_dir, "lrs2.prepare.summary.json"))
+    print()
+    print("fid 样例：%s" % (fids_all[0] if fids_all else "(空)"))
     print()
     print("下一步：")
     print("  1) 抽音频 + 唇部 ROI（官方脚本，见 pipeline_lrs2.sh 的 step 2/3）")

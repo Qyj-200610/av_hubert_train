@@ -1,20 +1,43 @@
-# AV-HuBERT (LRS2 复现) conda 环境 —— Linux + NVIDIA GPU
+# AV-HuBERT (LRS2 复现) conda 环境 —— 云 GPU 上的 Linux + NVIDIA GPU
+#
+# 使用场景：本机（Windows / Python 3.12 / RTX 5060 Laptop）无法运行 fairseq，
+# 实验统一在**租用的云 GPU** 上执行。本文件即云机器上要创建的环境。
+#   租机 -> 上传代码 -> conda env create -f environment.yml -> bash scripts/setup_env.sh
+# 详见 README 第 4.1 节。
 #
 # 版本选择说明（重要，踩坑点）：
 #   * fairseq 仓库被 pin 在 2021-06-15 的 commit afc77bd，它只兼容
 #     Python 3.8–3.10，且必须用 numpy 1.x（numpy 2.x 会导致 C++ 扩展编译失败）。
+#     实测（同一个 dataclass 模式，两种解释器对比）：
+#       Python 3.8.20 -> OK（接受 fairseq 的 `common: CommonConfig = CommonConfig()` 写法）
+#       Python 3.12.10 -> ValueError: mutable default ... for field common is not allowed
+#     故固定 python=3.8。**不要用 3.10 以上**。
 #   * torch 1.13.1 + CUDA 11.7 是该 commit 时代最好装、且官方验证过的组合。
-#   * opencv 不能按 av_hubert/requirements.txt 里的 4.5.4.60 装（无 py3.9 wheel），
-#     因此固定到 4.9.0.80，API 兼容。
-#   * scipy 相应从 1.10.0 提到 1.10.1（py3.9 有 wheel），语义无变化。
+#     恒源云镜像可直接选「PyTorch 1.13.1 / 11.7.0 / 3.8」，与本节完全对齐。
+#   * opencv 不能按 av_hubert/requirements.txt 里的 4.5.4.60 装
+#     （该版本没有 py3.8 的 wheel），因此固定到 4.9.0.80，API 兼容。
+#   * scipy 相应从 1.10.0 提到 1.10.1，语义无变化。
+#
+# ★★ 选卡的第一条硬性要求：算力 sm_XX 必须落在 torch 的架构列表内 ★★
+#   torch 1.13.1+cu117 的预编译包架构列表最高只到 sm_86，因此：
+#     可用  : V100(sm_70) / 2080 Ti(sm_75) / A100(sm_80) / 3090(sm_86)
+#     不可用: 4090(sm_89) / H100(sm_90) / 50 系(sm_120)
+#   注意「CUDA 版本」和「算力 sm_XX」是两回事：驱动够新只解决前者，
+#   算力不在列表里 kernel 照样跑不起来。
+#
+#   ⚠️ 租机下单前先跟平台确认卡型，租好后再花 30 秒验证：
+#     python -c "import torch; print(torch.cuda.get_arch_list()); \
+#                print(torch.cuda.get_device_capability(0))"
+#   若算力对应的 sm_XX 不在列表内，立即换机型，不要继续往下跑。
 #
 # 创建：
 #   conda env create -f environment.yml
 #   conda activate avhubert
 #   bash scripts/setup_env.sh          # 编译 fairseq 扩展 + 安装 avhubert
 #
-# 若你的服务器 CUDA 是 12.x，conda 里的 cudatoolkit=11.7 仍然可用
-# （PyTorch 自带 CUDA 运行时，只要驱动版本 >= 对应要求即可）。
+# 云机器上 CUDA 通常是 11.8/12.x：conda 里的 cudatoolkit=11.7 仍然可用
+# （PyTorch 自带 CUDA 运行时，只要驱动版本 >= 对应要求即可），
+# 但这只解决驱动兼容，**不解决算力（sm_XX）兼容**，两者不是一回事。
 
 name: avhubert
 
@@ -26,9 +49,12 @@ channels:
 
 dependencies:
   # ---- Python 与基础科学计算 ----
-  - python=3.9
+  # ★ python=3.8 而不是 3.9：conda 的 pytorch 1.13.1 + cudatoolkit=11.7 组合
+  #   在 linux-64 上主要覆盖 py3.8，选 3.8 可以整包走 conda、无需额外加 --index-url。
+  #   py3.9 也能跑（本仓库代码经 py3.8/3.9 均编译通过），但依赖解析更容易出问题。
+  - python=3.8
   - pip
-  - numpy=1.24.4          # ★ 必须 1.x
+  - numpy=1.24.4          # ★ 必须 1.x（numpy 2.x 会让 fairseq 的 C++ 扩展编译失败）
   - scipy=1.10.1
   - pandas
   - tqdm
@@ -37,14 +63,15 @@ dependencies:
   - scikit-learn
   - scikit-image
   - matplotlib
-  - ffmpeg=4.4            # 数据预处理需要；若服务器已有系统 ffmpeg 可删掉这行
+  - ffmpeg=4.4            # 数据预处理需要；若实例已自带 ffmpeg 可删掉这行
   - cmake
   - make
   - gcc_linux-64=11
   - gxx_linux-64=11
   - libsndfile
 
-  # ---- PyTorch ----
+  # ---- PyTorch（恒源云镜像已是 PyTorch 1.13.1 / CUDA 11.7.0 / Python 3.8 时，
+  #      这几项可省略，直接 conda create -n avhubert python=3.8 只装其余依赖）----
   - pytorch=1.13.1
   - torchaudio=0.13.1
   - cudatoolkit=11.7

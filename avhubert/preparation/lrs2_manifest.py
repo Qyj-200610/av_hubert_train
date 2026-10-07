@@ -115,17 +115,34 @@ def main():
     if not os.path.isfile(vocab_path):
         sys.exit("错误：词表生成失败，未见 %s" % vocab_path)
 
-    # ---------- 按前缀划分 ----------
+    # ---------- 划分：优先用 split.list，回退到 fid 前缀 ----------
+    #   flat  布局：fid = <video_id>/<clip_id>，目录里没有划分信息，
+    #              必须用 lrs2_prepare.py 产出的 split.list
+    #   split 布局：fid = <split>/<video_id>/<clip_id>，可直接读前缀
     buckets = {"train": [], "val": [], "test": []}
+    split_list_fn = os.path.join(work_dir, "split.list")
     unknown = 0
-    for i, fid in enumerate(fids):
-        prefix = fid.split("/")[0]
-        if prefix in buckets:
-            buckets[prefix].append(i)
-        else:
-            unknown += 1
+    if os.path.isfile(split_list_fn):
+        splits = read_lines(split_list_fn)
+        if len(splits) != len(fids):
+            sys.exit("错误：split.list(%d) 与 file.list(%d) 长度不一致"
+                     % (len(splits), len(fids)))
+        for i, s in enumerate(splits):
+            if s in buckets:
+                buckets[s].append(i)
+            else:
+                unknown += 1
+        print("划分来源：split.list（flat 布局）")
+    else:
+        for i, fid in enumerate(fids):
+            prefix = fid.split("/")[0]
+            if prefix in buckets:
+                buckets[prefix].append(i)
+            else:
+                unknown += 1
+        print("划分来源：fid 前缀（split 布局；如需 flat 请先产出 split.list）")
     if unknown:
-        print("警告：%d 条 fid 的划分前缀无法识别（既不是 train/ 也不是 val//test/）" % unknown)
+        print("警告：%d 条的划分无法识别" % unknown)
 
     if args.max_train is not None and len(buckets["train"]) > args.max_train:
         import random
@@ -174,8 +191,14 @@ def main():
                     p = ln.split()
                     if len(p) >= 2:
                         tags[p[0].rstrip("/")] = p[1].upper()
+            # tags 的键是 datalist 里的原始 fid（形如 <video_id>/<clip_id>）；
+            # flat 布局下 file.list 的 fid 与之一致，split 布局下需去掉前缀。
+            def norm(fid):
+                parts = fid.split("/")
+                return "/".join(parts[-2:]) if len(parts) > 2 else fid
+
             mv_idx = [i for i in buckets["test"]
-                      if tags.get(fids[i].split("/", 1)[1].rsplit(".", 1)[0], "") == "MV"]
+                      if tags.get(norm(fids[i]).rsplit(".", 1)[0], "") == "MV"]
             if mv_idx:
                 with open(os.path.join(out_dir, "test_mv.wrd"), "w", encoding="utf-8") as fo:
                     for i in mv_idx:

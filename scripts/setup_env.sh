@@ -31,7 +31,7 @@ fi
 
 log "1. 安装 av_hubert 的 pip 依赖"
 # 注意：不要直接 pip install -r requirements.txt —— 里面的 opencv-python==4.5.4.60
-# 在 py3.9 上没有 wheel。这里显式给出可用版本。
+# 在 py3.8 上没有 wheel。这里显式给出可用版本。
 pip install \
   python-speech-features==0.6 \
   scipy==1.10.1 \
