@@ -43,13 +43,32 @@ def detect_face_landmarks(face_predictor_path, cnn_detector_path, root_dir, land
     for fid in tqdm(fids):
         output_fn = os.path.join(output_dir, fid+'.pkl')
         video_path = os.path.join(input_dir, fid+'.mp4')
+        # ---- 断点续跑（本项目加的）----
+        # 产物按 fid 命名、结果确定，所以已算好的直接跳过。
+        # 官方原实现没有这个判断：任何中断（OOM / SSH 断开 / 手工 kill）
+        # 都会让整个 landmark 阶段从头再来——这是全流程最慢的一步
+        # （8 rank 下仍要数小时），代价太大。
+        # 用 pickle.load 校验而不是只看文件存在，避免把上次被 kill 时写坏的
+        # 半截 pkl 当成"已完成"永久保留。
+        if os.path.isfile(output_fn):
+            try:
+                with open(output_fn, 'rb') as fh:
+                    pickle.load(fh)
+                continue
+            except Exception:
+                pass   # 损坏则重算
         frames = load_video(video_path)
         landmarks = []
         for frame in frames:
             landmark = detect_landmark(frame, detector, cnn_detector, predictor)
             landmarks.append(landmark)
         os.makedirs(os.path.dirname(output_fn), exist_ok=True)
-        pickle.dump(landmarks, open(output_fn, 'wb'))
+        # 原子写：先写临时文件再 os.replace，保证 output_fn 要么不存在、
+        # 要么就是完整内容（配合上面的跳过逻辑才是安全的）
+        tmp_fn = output_fn + '.tmp'
+        with open(tmp_fn, 'wb') as fh:
+            pickle.dump(landmarks, fh)
+        os.replace(tmp_fn, output_fn)
     return
 
 

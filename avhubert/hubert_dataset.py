@@ -167,7 +167,8 @@ class AVHubertDataset(FairseqDataset):
             noise_fn=None,
             noise_prob=0,
             noise_snr=0,
-            noise_num=1
+            noise_num=1,
+            video_cache=None
     ):
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
@@ -175,6 +176,8 @@ class AVHubertDataset(FairseqDataset):
             else label_rates
         )
         self.modalities = set(modalities)
+        # 可选的「预解码帧缓存」目录（见 utils.FrameCache）。为 None 时行为与原来完全一致。
+        self.video_cache = custom_utils.FrameCache(video_cache) if video_cache else None
         self.audio_root, self.names, inds, tot, self.sizes = load_audio_visual(manifest_path, max_keep_sample_size, min_keep_sample_size, frame_rate=sample_rate, label_paths=label_paths, label_rates=self.label_rates)
         self.sample_rate = sample_rate
         self.stack_order_audio = stack_order_audio
@@ -296,7 +299,12 @@ class AVHubertDataset(FairseqDataset):
         return video_feats, audio_feats
 
     def load_video(self, audio_name):
-        feats = custom_utils.load_video(os.path.join(self.audio_root, audio_name))
+        video_path = os.path.join(self.audio_root, audio_name)
+        # 命中预解码缓存就直接拿内存映射里的帧，省掉这一次 mp4 解码（约 16 ms/clip，
+        # 是训练的实测瓶颈）；未命中自动回退到实时解码，不会因为缓存缺条目而失败。
+        feats = self.video_cache.get(video_path) if self.video_cache is not None else None
+        if feats is None:
+            feats = custom_utils.load_video(video_path)
         feats = self.transform(feats)
         feats = np.expand_dims(feats, axis=-1)
         return feats

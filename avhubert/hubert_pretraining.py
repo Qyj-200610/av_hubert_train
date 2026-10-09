@@ -156,6 +156,11 @@ class AVHubertPretrainingConfig(FairseqDataclass):
     noise_snr: Optional[str] = field(default='0', metadata={'help': 'noise SNR in audio'})
     noise_num: int = field(default=1, metadata={'help': 'number of noise wav files to mix'})
     fine_tuning: bool = field(default=False, metadata={"help": "set to true if fine-tuning AV-Hubert"})
+    video_cache: Optional[str] = field(
+        default=None,
+        metadata={"help": "directory of pre-decoded ROI frame cache (frames.bin + index.npz, "
+                          "see scripts/build_frame_cache.py); None = decode mp4 on the fly"},
+    )
 
 @register_task("av_hubert_pretraining", dataclass=AVHubertPretrainingConfig)
 class AVHubertPretrainingTask(FairseqTask):
@@ -268,7 +273,8 @@ class AVHubertPretrainingTask(FairseqTask):
             noise_fn=noise_fn,
             noise_prob=self.cfg.noise_prob,
             noise_snr=noise_snr,
-            noise_num=noise_num
+            noise_num=noise_num,
+            video_cache=getattr(self.cfg, "video_cache", None)
         )
 
     def max_positions(self) -> Tuple[int, int]:

@@ -28,6 +28,7 @@ python lrs2_manifest.py --work-dir /path/to/lrs2_data --datalist /path/to/lrs2_d
 
 import argparse
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -97,6 +98,27 @@ def main():
     vocab_dir = Path(work_dir) / ("spm%d" % args.vocab_size)
     vocab_dir.mkdir(exist_ok=True)
     spm_prefix = vocab_dir / ("spm_unigram%d" % args.vocab_size)
+    # 坑：小样本验证（LIMIT=30）时 sentencepiece 会自动降级到很小的 vocab，
+    # 但那批文件仍然叫 spm_unigram1000.*，并会写下 vocab_size.txt。之后在同一个
+    # WORK 目录里跑全量时，下面这个"已存在就跳过"会把**只有几十个 piece 的降级词表**
+    # 直接拿去用，而 vocab_size.txt 此前没有任何地方读，于是全程静默降质。
+    # 这里改成：记录的词表大小与本次要求不一致就重训（并说清原因）。
+    prev_size = None
+    prev_size_fn = Path(work_dir) / "vocab_size.txt"
+    if prev_size_fn.is_file():
+        try:
+            prev_size = int(prev_size_fn.read_text().strip())
+        except Exception:
+            prev_size = None
+    if prev_size is not None and prev_size != args.vocab_size \
+            and (vocab_dir / ("spm_unigram%d.txt" % args.vocab_size)).is_file():
+        print("警告：已有词表是降级产物（记录 vocab_size=%d，本次要求 %d）。"
+              % (prev_size, args.vocab_size))
+        print("      将删除并重新训练，避免把降级词表用到全量实验上。")
+        for suffix in (".model", ".vocab", ".txt"):
+            p = Path(spm_prefix.as_posix() + suffix)
+            if p.is_file():
+                p.unlink()
     if (vocab_dir / ("spm_unigram%d.txt" % args.vocab_size)).is_file():
         print("词表已存在，跳过 sentencepiece 训练：%s" % spm_prefix.as_posix() + ".txt")
     else:
@@ -109,6 +131,31 @@ def main():
             tmp_txt = f.name
         try:
             gen_vocab(Path(tmp_txt), spm_prefix, "unigram", args.vocab_size)
+            # 正常路径也要记录实际词表大小：否则"降级过、又重训成 1000"时
+            # vocab_size.txt 会停留在旧值，上面的校验就会误判。
+            with open(os.path.join(work_dir, "vocab_size.txt"), "w") as fo:
+                fo.write("%d\n" % args.vocab_size)
+        except RuntimeError as e:
+            # sentencepiece 在语料过小时会报
+            #   Vocabulary size too high (N). Please set it to a value <= M.
+            # 这只在小样本验证（如 LIMIT=30）时出现；全量语料不会有此问题。
+            # 这里按报错给出的上限自动降级重试，避免把"样本太小"误判为流程失败。
+            m = re.search(r"value <= (\d+)", str(e))
+            if not m:
+                raise
+            fallback = int(m.group(1))
+            print("警告：vocab_size=%d 超过当前语料可支持的上限 %d（通常因为样本量太小）。"
+                  % (args.vocab_size, fallback))
+            print("      自动降级为 vocab_size=%d 重试。正式全量运行时请保持 1000。" % fallback)
+            # 清理可能残留的半成品
+            for suffix in (".model", ".vocab", ".txt"):
+                p = Path(spm_prefix.as_posix() + suffix)
+                if p.is_file():
+                    p.unlink()
+            gen_vocab(Path(tmp_txt), spm_prefix, "unigram", fallback)
+            # 记录实际使用的词表大小，供后续步骤引用
+            with open(os.path.join(work_dir, "vocab_size.txt"), "w") as fo:
+                fo.write("%d\n" % fallback)
         finally:
             os.unlink(tmp_txt)
     vocab_path = spm_prefix.as_posix() + ".txt"

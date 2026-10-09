@@ -1,4 +1,6 @@
-# @package _group_
+# @package _global_
+#
+# 注意：必须是 _global_（原因见 base_lrs2_video_only.yaml 顶部说明）。
 #
 # LRS2 小规模冒烟测试配置（smoke test）
 # 目的：用极少的更新步数把「数据加载 → 前向 → 反向 → 验证 → 解码」整条链路跑通，
@@ -98,16 +100,20 @@ model:
   activation_dropout: 0.1
   attention_dropout: 0.0
   feature_grad_mult: 1.0
-  decoder_layers: 9
+  # ---- 解码器尺寸 = 官方 base 默认值（768 / 3072 / 6 层 / 4 头）----
+  # 原来这里是 large 的 1024/4096/8，配 base 编码器（768 维）第一次前向就崩：
+  #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (204x768 and 1024x1024)
+  # 原因：AVHubertSeq2SeqConfig 没有 encoder_embed_dim 字段 → transformer_layer.py:263
+  # 取到 None → multihead_attention.py:43-44 把 cross-attention 的 kdim 回退成
+  # decoder_embed_dim=1024，而编码器 memory 只有 768 维。详见
+  # base_lrs2_video_only.yaml 顶部的修复记录。
+  decoder_layers: 6
   decoder_dropout: 0.1
   decoder_attention_dropout: 0.0
   decoder_activation_dropout: 0.1
   freeze_finetune_updates: 0    # ★ 冒烟测试不冻结，确保编码器真的参与反传
   share_decoder_input_output_embed: true
   decoder_normalize_before: true
-  decoder_embed_dim: 1024
-  decoder_ffn_embed_dim: 4096
-  decoder_attention_heads: 8
 
 hydra:
   job:

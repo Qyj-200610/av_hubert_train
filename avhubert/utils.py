@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import cv2
+import os
 import torch
 import random
 import numpy as np
@@ -28,6 +29,107 @@ def load_video(path):
             print(f"failed loading {path} ({i} / 3)")
             if i == 2:
                 raise ValueError(f"Unable to load {path}")
+
+
+class _CacheUnavailable(Exception):
+    """帧缓存目录缺失或索引与 bin 不配套时抛出（内部用，调用方会回退到在线解码）。"""
+
+
+class FrameCache(object):
+    """预先解码好的 ROI 帧缓存（numpy 内存映射），用来省掉每样本的 mp4 解码。
+
+    为什么要它（实测数据，单卡 3090 + 8 核配额）
+    --------------------------------------------
+    每个 clip 的 ``load_video`` 约 16–17 ms，拆开看是：
+
+        open 4.1 ms | 逐帧 read 12.1 ms | cvtColor 0.6 ms | stack 0.4 ms
+
+    而一个 4000-token 的 batch 约 80 个 clip，光解码就要 1.3 秒，
+    比这一步的 GPU 前反向还贵——**训练实际是在等数据，不是等 GPU**。
+    ROI 帧总量实测约 **24 GB**（2,611,599 帧 × 96×96 字节），
+    预解码成一个大文件 + 内存映射后读取退化成一次 memcpy
+    （页缓存命中约 0.1 ms/clip，对比在线解码约 16 ms），代价是磁盘占用。
+
+    用法
+    ----
+        cache = FrameCache('/path/to/frame_cache')   # 目录含 frames.bin / index.npz
+        frames = cache.get('/abs/path/to/xxx.mp4')   # 命中 -> (T,H,W) uint8；未命中 -> None
+
+    未命中时调用方应回退到 ``load_video``，所以缓存缺条目不会让训练失败。
+    缓存的键是「数据集里解析出来的视频绝对路径」，和 ``load_video`` 收到的路径一致。
+    """
+
+    def __init__(self, cache_dir):
+        self.dir = cache_dir
+        self._mm = None
+        self._pid = None
+        self._keys = None
+        self._hits = 0
+        self._misses = 0
+        self._broken = False
+        self._why = ""
+
+    def _ensure(self):
+        # DataLoader 是多进程：fork 出来的子进程要各自重新打开 memmap，
+        # 所以这里按 pid 判断，而不是只在构造时打开一次。
+        if self._mm is not None and self._pid == os.getpid():
+            return
+        if self._broken:
+            # 缓存目录缺失/不配套时不要把训练搞崩：退化成"永远未命中"，
+            # 由调用方回退到在线解码（只是慢一点）。只在第一次打一条警告。
+            raise _CacheUnavailable(self._why)
+        try:
+            self._load()
+        except Exception as e:                                # noqa: BLE001
+            self._broken = True
+            self._why = "%s（%s）" % (self.dir, e)
+            print("警告：帧缓存不可用，回退到在线解码：%s" % self._why)
+            raise _CacheUnavailable(self._why)
+
+    def _load(self):
+        bin_path = os.path.join(self.dir, "frames.bin")
+        index_path = os.path.join(self.dir, "index.npz")
+        with np.load(index_path, allow_pickle=False) as idx:
+            bin_size = int(idx["bin_size"]) if "bin_size" in idx else None
+            keys = idx["keys"]
+            offsets = idx["offsets"]
+            lengths = idx["lengths"]
+            heights = idx["heights"]
+            widths = idx["widths"]
+            self._keys = {
+                str(k): (int(o), int(l), int(h), int(w))
+                for k, o, l, h, w in zip(keys, offsets, lengths, heights, widths)
+            }
+        # 索引与 bin 是否配套：不配套就把缓存标记为不可用，绝不带着错位的
+        # offset 去读——那种情况下每个切片都能 reshape 成功，会静默读到
+        # 别的 clip 的帧（见 build_frame_cache.py 里的说明）。
+        actual = os.path.getsize(bin_path)
+        if bin_size is not None and actual != bin_size:
+            raise ValueError("frames.bin 大小 %d != 索引记录的 %d，索引与 bin 不配套"
+                             % (actual, bin_size))
+        self._mm = np.memmap(bin_path, dtype=np.uint8, mode="r")
+        self._pid = os.getpid()
+
+    def __len__(self):
+        self._ensure()
+        return len(self._keys)
+
+    def hit_rate(self):
+        tot = self._hits + self._misses
+        return (float(self._hits) / tot) if tot else 0.0
+
+    def get(self, path):
+        try:
+            self._ensure()
+        except _CacheUnavailable:
+            return None
+        item = self._keys.get(path)
+        if item is None:
+            self._misses += 1
+            return None
+        off, length, h, w = item
+        self._hits += 1
+        return self._mm[off: off + length * h * w].reshape(length, h, w)
 
 
 class Compose(object):
@@ -68,6 +170,12 @@ class Normalize(object):
         Returns:
             Tensor: Normalized Tensor image.
         """
+        # 显式转 float32：不做的话 uint8 与 python float 相减会被提升成 **float64**，
+        # 而这一串 transform 的出口在 hubert_dataset.py 里本来就要 astype(np.float32)。
+        # float64 中间结果让每个 500 帧 clip 多出约 36.8 MB 的拷贝（float32 是 18.4 MB），
+        # 在 8 个 DataLoader worker 里就是白白的带宽和分配器压力。
+        if frames.dtype == np.uint8 or frames.dtype == np.uint16:
+            frames = frames.astype(np.float32)
         frames = (frames - self.mean) / self.std
         return frames
 

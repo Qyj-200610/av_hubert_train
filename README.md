@@ -184,9 +184,78 @@ bash scripts/run_finetune.sh smoke
 NGPU=1 bash scripts/run_finetune.sh train      # 单卡就写 1
 
 # ⑦ 测试并拿点数
-bash scripts/run_finetune.sh test "$EXP/train/checkpoint_best.pt" test
+bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" test
 cat "$EXP/decode_test/wer.test"
 ```
+
+#### 实机环境记录（恒源云 RTX 3090 实例，已实测）
+
+拿到实例后跑了一遍完整探测，结果记录在此，便于对照排查：
+
+| 项目 | 实测值 |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 3090，24576 MiB，**compute_cap 8.6** |
+| 驱动 / CUDA | 驱动 550.163.01；`/usr/local/cuda-11.7`，`cuda.h` 中 `CUDA_VERSION 11070` |
+| Python | 3.8.10（系统）+ conda 3.8.20（新建环境） |
+| conda | 23.5.0，路径 `/usr/local/miniconda3`（**不在默认 PATH**，需 `export PATH=/usr/local/miniconda3/bin:$PATH`） |
+| **conda solver** | **只有 `classic`，没有 libmamba** —— conda-forge 求解会很慢，注意留足超时 |
+| 镜像源 | conda / pip 已预配清华与阿里云源 |
+| 系统盘 | `/` overlay 30 GB（**别放数据**） |
+| 数据盘 | `/hy-tmp` xfs，**容量需在控制台扩容**（默认 50 GB，可扩到 100 GB） |
+| 工具 | `git`、`ffmpeg`(需 apt 装)、`oss`(恒源云定制版，含 `login`)、`rclone`、`unzip`、`7z` |
+| **缺失** | `rsync`、`zstd`、`pigz`、`pv` —— 传包时注意用 gzip 而非 zstd |
+
+**已验证的兼容性结论**（最关键的一条）：
+
+```
+torch 1.13.1+cu117  ->  cuda_avail True
+arch list           ->  ['sm_37','sm_50','sm_60','sm_70','sm_75','sm_80','sm_86']
+device capability   ->  (8, 6)   ==  sm_86   ✓ 在列表内
+```
+
+即「RTX 3090 可用于本项目」这一判断已在真实实例上得到验证。
+
+#### 产物体积估算（决定 `/hy-tmp` 要多大）
+
+由 48,164 条 clip、平均单个 mp4 143 KB 反推：每条约 2 秒、约 500 kbps
+（125 KB / 2 s ≈ 500 kbps，× 48,164 ≈ 6.94 GB，与实测 6.77 GB 吻合）。
+
+| 产物 | 估算体积 |
+| --- | --- |
+| 原始 `main/`（mp4+txt） | **6.77 GB**（实测） |
+| `audio/`（16 kHz mono wav） | ~3.1 GB |
+| `landmark/`（68 点 pkl） | ~1.3 GB |
+| `video/`（96×96 ROI mp4） | ~5–10 GB（取决于编码码率） |
+| manifest / 词表 | < 20 MB |
+| **合计** | **约 16–21 GB** |
+
+总帧数约 **240 万帧**。dlib 关键点检测**单进程实测约 0.45 it/s（2.2 s/clip）**，
+串行跑完 48,164 条约需 **30 小时**——这是整条流水线的真正瓶颈，
+必须靠分片并行（`pipeline_lrs2.sh` 的 `all` 模式已改为阶段内 8 rank 并行，
+见 `docs/预处理并行化方案.md` 执行记录）。
+因此 **`/hy-tmp` 建议 ≥ 100 GB**：留出「原始数据 + 全部产物 + 训练 checkpoint」的余量。
+
+#### 数据上传的实测参数（重要，避免走弯路）
+
+把 6.77 GB 数据集传到实例，实测了几种方式：
+
+| 方式 | 吞吐 | 结论 |
+| --- | --- | --- |
+| 单连接 SFTP，**`pipelined=True`** | **1.70 MB/s** | ✅ 最优，约 66 分钟 |
+| 单连接 SFTP，`pipelined=False` | 0.42 MB/s | ❌ 慢 4 倍 |
+| 2 连接并行 | 1.69 MB/s（合计） | 无收益 |
+| 8 连接并行 | 网关直接拒绝 | ❌ **会触发限流，禁止** |
+
+**三个结论**：
+
+1. **`pipelined=True` 是决定性的**（0.42 → 1.70 MB/s，4 倍差距），连接数不是
+2. **并行连接无收益**：带宽瓶颈在链路上，2 连接合计与单连接相同
+3. **并发连接数过高会被网关拒绝**（`Error reading SSH protocol banner`）。
+   实测 8 连接时全部握手失败，且之后连单连接也会被短暂拒绝，
+   **不要开 8 条以上连接**；用 `parallel_upload.py --conns 1` 即可
+
+另外注意：**实例下行很快（实测清华镜像 60 MB/s），慢的只有「本机→实例」这条路**。
+如果数据已存在于平台侧（个人数据 / 公网），让实例自己去拉会快得多。
 
 #### 选卡的注意事项（这里很容易踩坑，务必看）
 
@@ -305,7 +374,14 @@ WER 大概率是几十个百分点，**不是一个能交差的点数**。建议
 我们的路线就是**用官方预训练权重 + 在 main 上微调 + 在 test 上测试**，
 从而完全绕开 pretrain。
 
-**下载后请先核对目录结构**（`lrs2_prepare.py` 依赖这个约定）：
+**下载后请先核对目录结构**（`lrs2_prepare.py` 依赖这个约定）。
+
+> ⚠️ **实测结论：本考核的数据集是「扁平」结构**，即
+> `main/<video_id>/<clip_id>.mp4`，**没有 `train/` `val/` `test/` 子目录**。
+> 所以下面这份带划分目录的示意**不适用**于本考核数据，仅供另一种打包方式参考。
+> 扁平布局直接用 `--layout flat`（默认值），详见 §5.1。
+
+若是带划分子目录的打包方式，结构应形如：
 
 ```
 main/
@@ -315,17 +391,19 @@ main/
 └── test/<video_id>/<clip_id>.{mp4,txt}
 ```
 
-校验命令（在下载完成后、跑流水线之前执行）：
+两种布局通用的判别与校验命令：
 
 ```bash
-# 1. 目录名是否为 train / val / test（注意是 val，不是 valid）
-ls -d main/*/
+# 1. 看顶层到底是划分目录还是 video_id 目录
+ls main/ | head
+#   输出 train/val/test        -> 用 --layout split
+#   输出一串很长数字(video_id) -> 用 --layout flat（本考核即为此）
 
 # 2. 抽查一个 clip：mp4 与同名 txt 是否都在
-ls main/train/5535415699068794046/00001.*
+ls main/5535415699068794046/00001.*
 
-# 3. 抽查 txt 内容（应能看到 TEXT: 开头的转写行）
-head -3 main/train/5535415699068794046/00001.txt
+# 3. 抽查 txt 内容（本数据集格式为 Text: + Conf:）
+head -3 main/5535415699068794046/00001.txt
 ```
 
 `lrs2_prepare.py` 会逐条校验 45,839 + 1,082 + 1,243 条的 mp4 与标注是否齐全，
@@ -380,7 +458,10 @@ export DATALIST=/path/to/lrs2_datalist
 export WORK=/path/to/lrs2_data               # 输出都放这里（云上建议放 /hy-tmp）
 export FFMPEG=$(which ffmpeg)
 export DLIB=/path/to/dlib
-export NSHARD=8                              # 并行分片数，云上可用 $(nproc)
+export NSHARD=8                              # 并行分片数：**看 cgroup 配额，别信 $(nproc)**
+                                             # 本实例 nproc=64，但 cgroup 配额只有 8 核
+                                             # （cpu.cfs_quota_us/cpu.cfs_period_us = 800000/100000）
+                                             # 设成 64 只会增加上下文切换，不会更快
 export LAYOUT=flat                           # 本考核数据集为 flat；带划分子目录时改 split
 
 bash scripts/fetch_dlib_models.sh "$DLIB"    # 下载 dlib 模型 + 20words_mean_face.npy
@@ -412,11 +493,15 @@ export EXP=$(pwd)/exp
 # 1) 先冒烟测试：20 步，确认数据 / 模型 / 反传都通
 bash scripts/run_finetune.sh smoke
 
-# 2) 正式微调（8 卡；单卡会自动把 world_size 设为 1）
-NGPU=8 bash scripts/run_finetune.sh train
+# 2) 正式微调（单卡自动把 world_size 设为 1；多卡时 NGPU=卡数）
+NGPU=1 bash scripts/run_finetune.sh train
+
+# 2') 或者：快速微调（单卡 3090 赶时间用这个；省时改造与实测见
+#     docs/训练加速与阻塞修复记录.md）
+bash scripts/run_finetune.sh fast
 
 # 3) 在 test 集上做纯视觉唇读解码，输出 WER
-bash scripts/run_finetune.sh test "$EXP/train/checkpoint_best.pt" test
+bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" test
 ```
 
 ### 关键配置说明
@@ -443,7 +528,10 @@ python avhubert/infer_s2s.py --config-dir avhubert/conf --config-name s2s_decode
   override.modalities="['video']" common.user_dir=$(pwd)
 ```
 
-结果写入 `{results_path}/wer.{split}`，形如 `WER: 12.34`。**这就是题目要汇报的「点数」。**
+结果写入 `{results_path}/wer.<哈希>`，内容形如 `WER: 12.34`。**这就是题目要汇报的「点数」。**
+（注意：文件名不是 `wer.test`，而是 `wer.` 加上 generation 配置的哈希，
+见 `infer_s2s.py:247-259`；逐句假设在同目录的 `hypo-<哈希>.json`。
+`scripts/run_finetune.sh test` 已用通配符自动找到并打印。）
 
 ---
 
@@ -453,7 +541,7 @@ python avhubert/infer_s2s.py --config-dir avhubert/conf --config-name s2s_decode
 `lrs2_manifest.py` 已额外生成 `test_mv.{tsv,wrd}`，可直接：
 
 ```bash
-bash scripts/run_finetune.sh test "$EXP/train/checkpoint_best.pt" test_mv
+bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" test_mv
 ```
 
 建议同时汇报：

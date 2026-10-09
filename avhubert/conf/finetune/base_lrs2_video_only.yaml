@@ -1,10 +1,34 @@
-# @package _group_
+# @package _global_
+#
+# 注意：必须是 _global_。Hydra ≥1.1 中 `_group_` 指"配置所在分组目录"，
+# 本文件在 avhubert/conf/finetune/ 下，用 _group_ 会把所有键挂到 finetune.*，
+# 导致 common.user_dir / task.data 等命令行覆盖报
+# "Could not override ... Key 'common' is not in struct"。
 #
 # AV-HuBERT 在 LRS2(main) 上微调 —— 基座模型(base) + 纯视觉(video-only)
-# 对应官方 avhubert/conf/finetune/base_vox_433h.yaml，改动如下：
-#   * 新增逐层参数说明与 LRS2 相关注释，便于复现
-#   * max_update / warmup 等超参沿用官方 LRS3-433h 设置（LRS2 main 约 100+ 小时，
-#     与此量级接近），如算力紧张可下调
+# 对应官方 avhubert/conf/finetune/base_vox_433h.yaml，只改数据路径与注释。
+#
+# ⚠ 修复记录（重要，原文件是跑不起来的）
+# -----------------------------------------------------------------------------
+# 原文件其实是从 **large_vox_433h.yaml** 抄来的（max_update 30000 / warmup 10000 /
+# decay 20000 / decoder_layers 9 / decoder_embed_dim 1024 / ffn 4096 / heads 8），
+# 而本项目用的是 **base** 权重（编码器 12 层 × 768 维，已用 state_dict 核对）。
+# 后果不是"慢一点"，而是**第一次前向就崩**：
+#   decoder_embed_dim=1024 时，解码器 cross-attention 的 k_proj 会被建成
+#   Linear(1024,1024)，而编码器 memory 只有 768 维 ——
+#   fairseq/modules/transformer_layer.py:263 用
+#   `kdim=getattr(args,"encoder_embed_dim",None)` 取值，而 AVHubertSeq2SeqConfig
+#   里**根本没有 encoder_embed_dim 这个字段**（hubert_asr.py 里 0 处），
+#   于是 None → multihead_attention.py:43-44 回退成 kdim=embed_dim=1024。
+# 实测（本机 base 权重断言复现）：
+#   RuntimeError: mat1 and mat2 shapes cannot be multiplied (204x768 and 1024x1024)
+#
+# 修法：解码器尺寸回归官方 base 默认值（768 / 3072 / 6 层 / 4 头），
+# 也就是把 large 的那几行覆盖去掉——这正是 base_vox_433h.yaml 的做法
+# （它只显式写了 decoder_layers: 6，其余走 AVHubertSeq2SeqConfig 的默认值）。
+# 同时调度也回到官方 base：max_update 45000 / warmup 15000 / decay 30000，
+# 且 freeze_finetune_updates = 22500 = **一半**（官方是前半冻结、后半解冻；
+# 原文件写的 30000 = max_update，等于编码器全程冻结，那是 large 的配法）。
 #
 # 关键：本配置只做 **纯视觉唇读**，故 task.modalities 只有 "video"。
 #       （论文 LRS2 上 video-only 的测试结果即由这一类配置得到）
@@ -64,7 +88,7 @@ criterion:
   label_smoothing: 0.1
 
 optimization:
-  max_update: 30000
+  max_update: 45000                # 官方 base_vox_433h.yaml:57
   lr: [0.001]
   sentence_avg: true
   update_freq: [1]
@@ -76,9 +100,9 @@ optimizer:
 
 lr_scheduler:
   _name: tri_stage
-  warmup_steps: 10000
+  warmup_steps: 15000              # 官方 base_vox_433h.yaml:69
   hold_steps: 0
-  decay_steps: 20000
+  decay_steps: 30000               # 官方 base_vox_433h.yaml:71
   final_lr_scale: 0.05
 
 model:
@@ -98,16 +122,20 @@ model:
   activation_dropout: 0.1
   attention_dropout: 0.0
   feature_grad_mult: 1.0
-  decoder_layers: 9
+  # ---- 解码器尺寸 = 官方 base 默认值（AVHubertSeq2SeqConfig）----
+  # 这里**不要**写 decoder_embed_dim: 1024 / ffn 4096 / heads 8：
+  # 那是 large 的尺寸，配 base 编码器（768 维）会让 cross-attention 的 k_proj
+  # 变成 1024x1024 而编码器 memory 是 768，第一次前向就
+  #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (204x768 and 1024x1024)
+  # 原因见本文件顶部的修复记录。
+  decoder_layers: 6                # 官方 base_vox_433h.yaml:91 也是 6
   decoder_dropout: 0.1
   decoder_attention_dropout: 0.0
   decoder_activation_dropout: 0.1
-  freeze_finetune_updates: 30000
+  freeze_finetune_updates: 22500   # 官方 base_vox_433h.yaml:95 = max_update 的一半
+                                   # （前半冻结编码器、后半解冻；原文件写 30000 是 large 的配法）
   share_decoder_input_output_embed: true
   decoder_normalize_before: true
-  decoder_embed_dim: 1024
-  decoder_ffn_embed_dim: 4096
-  decoder_attention_heads: 8
 
 hydra:
   job:

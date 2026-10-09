@@ -179,9 +179,10 @@ def main():
                     help="目录布局。flat: main/<video_id>/<clip>.mp4（本考核实测即为该布局）；"
                          "split: main/<split>/<video_id>/<clip>.mp4")
     ap.add_argument("--copy-video-to", default=None,
-                    help="可选：把原始 mp4 按 fid 结构复制/硬链接到该目录（默认不复制，直接用原路径）")
+                    help="（未实现）原文档说把原始 mp4 复制/硬链接到该目录；实际上这个参数"
+                         "此前被静默忽略，现在改为显式报错，避免「以为复制了其实没有」")
     ap.add_argument("--link", action="store_true",
-                    help="配合 --copy-video-to 使用硬链接而非复制（同一文件系统时省空间）")
+                    help="（未实现）配合 --copy-video-to 的硬链接开关，同上")
     ap.add_argument("--split-prefix", action="store_true", default=True,
                     help="仅 split 布局生效：fid 前加划分前缀（train/val/test）")
     ap.add_argument("--no-split-prefix", dest="split_prefix", action="store_false")
@@ -201,6 +202,14 @@ def main():
     limit_map = {"train": args.max_train, "val": args.max_valid, "test": args.max_test}
 
     # ---------- 检查输入 ----------
+    # --copy-video-to / --link 从来没有被实现过（参数被解析后无人使用），
+    # 传了会"静默什么都不做"。改成明确报错，免得以为 mp4 已经固化下来了。
+    # （本流程一直是直接用 --lrs2-root 下的原始 mp4：detect_landmark/align_mouth
+    #   的 --root / --video-direc 都指向那里。）
+    if args.copy_video_to or args.link:
+        sys.exit("错误：--copy-video-to / --link 尚未实现（此前会被静默忽略）。\n"
+                 "      本流程直接使用 --lrs2-root 下的原始 mp4；若需要把 mp4 固化到\n"
+                 "      工作目录，请自行 cp/rsync 后再把 --lrs2-root 指过去。")
     if not os.path.isdir(args.lrs2_root):
         sys.exit("错误：--lrs2-root 不存在：%s" % args.lrs2_root)
     if not os.path.isdir(args.datalist):
@@ -290,6 +299,34 @@ def main():
         print("确认无误后，可加 --allow-missing 跳过缺失项继续。")
         print("=" * 72)
         sys.exit(1)
+
+    # ---------- 重复 / 跨划分泄漏检查（原实现只把冲突数打印出来，不做任何拦截）----------
+    # 为什么必须有：flat 布局下 out_fid 就是 fid，所以同一个 fid 若同时出现在两份列表里，
+    # 会被**分别写进 train.tsv 与 test.tsv，且指向同一个 video/<fid>.mp4**
+    # —— 测试片段静默进了训练集，WER 会被抬高，而日志里一个字都不会提。
+    # （已核实本次题目给的三个列表是干净的：0 重复、两两交集为空、无共享 video_id；
+    #   这个检查是为了防止以后换数据版本时踩坑。）
+    dup_all = len(fids_all) - len(set(fids_all))
+    if dup_all:
+        from collections import Counter
+        dup_items = [x for x, c in Counter(fids_all).items() if c > 1]
+        print()
+        print("=" * 72)
+        print("错误：共 %d 条 clip 在不同划分里重复出现（重复条目 %d 个）。" % (dup_all, len(dup_items)))
+        print("      同一 clip 会被写进多份 tsv，测试集数据会泄漏进训练集。")
+        print("      示例：%s" % ", ".join(dup_items[:5]))
+        print("      请检查 --datalist 里的三个列表是否有重叠。")
+        print("=" * 72)
+        sys.exit(1)
+    for a, b in (("train", "valid"), ("train", "test"), ("valid", "test")):
+        sa = {f for f, s in zip(fids_all, splits_all) if s == a}
+        sb = {f for f, s in zip(fids_all, splits_all) if s == b}
+        inter = sa & sb
+        if inter:
+            print("=" * 72)
+            print("错误：%s 与 %s 划分有 %d 条重叠（示例：%s）" % (a, b, len(inter), list(inter)[:3]))
+            print("=" * 72)
+            sys.exit(1)
 
     # ---------- 落盘 ----------
     file_list = os.path.join(args.work_dir, "file.list")

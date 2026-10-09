@@ -1,0 +1,210 @@
+# @package _global_
+#
+# 注意：这里**必须**是 _global_，不能沿用官方那份的 `# @package _group_`。
+# Hydra ≥1.1 里 `_group_` 表示"配置所在的分组目录"，而本文件位于
+# avhubert/conf/finetune/ 下，于是所有键会被挂到 `finetune.*` 而不是顶层，
+# 命令行覆盖 common.user_dir / task.data 就会直接报：
+#     Could not override 'common.user_dir'. Key 'common' is not in struct
+# （fairseq 自带的 config.yaml 用的是 _group_，但它在 conf 根目录，
+#   `_group_` 恰等于全局包，所以那份没问题。）
+#
+# =============================================================================
+# LRS2 快速微调配置（在 base_lrs2_video_only.yaml 基础上做「省时间」改造）
+# =============================================================================
+#
+# 用途：算力只有 **单张 RTX 3090**、要求尽快拿到 WER 点数时使用。
+#       忠实复现（对齐官方）请仍用 base_lrs2_video_only.yaml。
+#
+# 重要背景（改这份配置的原因）
+# -----------------------------------------------------------------------------
+# 原 `base_lrs2_video_only.yaml` 实际上是 **large 模型配置**的副本：
+# 它逐项照抄了 `finetune/large_vox_433h.yaml`——
+#   max_update 30000 / warmup 10000 / decay 20000 / freeze_finetune_updates 30000
+#   decoder_layers 9 / decoder_embed_dim 1024 / decoder_ffn_embed_dim 4096 / heads 8
+# 而本项目用的预训练权重是 **base**（`base_vox_iter4.pt`，编码器 768 维）。
+# 于是形成「base 编码器 + large 解码器」的错配：
+#   * **最严重的后果不是变慢，而是第一次前向就崩**（实测）：
+#       RuntimeError: mat1 and mat2 shapes cannot be multiplied (204x768 and 1024x1024)
+#     原因：`AVHubertSeq2SeqConfig` 里**没有** `encoder_embed_dim` 字段
+#     （hubert_asr.py 里 0 处），于是 `fairseq/modules/transformer_layer.py:263`
+#     的 `kdim=getattr(args,"encoder_embed_dim",None)` 取到 None，
+#     `multihead_attention.py:43-44` 把 cross-attention 的 kdim 回退成
+#     decoder_embed_dim=1024 —— 而编码器 memory 只有 768 维，k_proj(1024x1024) 一乘就炸。
+#   * 解码器参数量约 151M，而官方 base 解码器约 57M（**2.6 倍**）
+#   * 官方 base（`base_vox_433h.yaml`）用的是 max_update 45000 且
+#     **freeze_finetune_updates 22500 = 一半**（前半冻结、后半解冻）
+#
+# 本配置的四项改造（按收益排序）
+# -----------------------------------------------------------------------------
+# 1) 解码器回到官方 base 尺寸：768 / 3072 / 6 层 / 4 头
+#    → 这是**能跑起来**的前提（见上），顺带让参与反传的参数量降到约 1/2.6。
+#    ⚠ 更正一处早先写错的理由：这里**不是**为了省掉某个"768→1024 投影层"。
+#      `hubert_asr.py:319` 的那个 proj 属于 `HubertEncoder`，只有 CTC 分支
+#      （`AVHubertCtc`）会用；seq2seq 走的是 `HubertEncoderWrapper`（:471），没有 proj。
+#
+# 2) 加大 batch、减少步数（等价数据量下大幅省时）
+#    max_tokens 1000 → 4000（约 20 → 80 条/clip 每批），max_update 30000 → 8000。
+#    因为编码器全程 no_grad，显存几乎只由解码器决定，24G 放得下大 batch。
+#    数据曝光量：原 30000×1000 = 30M tokens；本配置 8000×4000 = 32M tokens，
+#    **曝光量基本不变，但优化步数少 3.75 倍**。
+#
+# 3) 编码器全程冻结：freeze_finetune_updates = max_update
+#    `AVHubertSeq2Seq.forward`（hubert_asr.py:493）在冻结期把编码器包在
+#    `torch.no_grad()` 里 → 省掉编码器的反向与激活显存，只训解码器。
+#    这是"砍掉相对不重要的训练"的主要取舍：编码器已由 LRS3+Vox 预训练成
+#    较强的唇读特征提取器，只适配解码器能拿到大部分收益，但**代码里从未解冻
+#    编码器，WER 会比官方解冻配方差一些**。想贴近官方语义就把
+#    freeze_finetune_updates 改成一半（4000），代价是后半程每步明显变慢。
+#
+# 4) 验证按步数触发，而不是按 epoch
+#    原配置 validate_interval: 2（每 2 个 epoch 验一次）。改用
+#    validate_interval_updates: 2000 后，不管 batch/数据量怎么调，
+#    都只在第 2000/4000/6000/8000 步验证，开销可预期。
+#    （train.py:378-387 的 do_validate 每个 step 都会判定，见源码。）
+#
+# 用法
+# -----------------------------------------------------------------------------
+#   python fairseq/fairseq_cli/hydra_train.py \
+#     --config-dir avhubert/conf --config-name finetune/base_lrs2_video_only_fast \
+#     common.user_dir=$(pwd) \
+#     task.data=$DATA task.label_dir=$DATA task.tokenizer_bpe_model=$BPE \
+#     model.w2v_path=$CKPT hydra.run.dir=$EXP/fast
+#
+#   或直接：bash scripts/run_finetune.sh fast
+#
+# 想再快/再慢，命令行覆盖即可（不必改文件）：
+#   optimization.max_update=4000        # 只跑 8000 的一半
+#   dataset.max_tokens=8000             # 再加大 batch
+#   optimization.lr=0.001               # 大 batch 若不稳就调回
+#   model.freeze_finetune_updates=4000  # 后半程解冻编码器（贴近官方）
+#   optimization.stop_time_hours=2      # 硬性墙钟上限，兜底用
+
+common:
+  fp16: true
+  log_format: json
+  log_interval: 50          # 步数少了，日志密一点便于观察（原 200）
+  tensorboard_logdir: tblog
+  seed: 1337
+  user_dir: ???
+
+checkpoint:
+  save_interval: 1
+  save_interval_updates: 2000   # 与验证对齐，少存几次少占 I/O
+  keep_interval_updates: 1
+  no_epoch_checkpoints: true
+  best_checkpoint_metric: accuracy
+  maximize_best_checkpoint_metric: true
+
+distributed_training:
+  ddp_backend: c10d
+  find_unused_parameters: true   # 必须为 true：video-only 时音频分支参数未使用
+  distributed_world_size: 1      # 单卡 3090；脚本会按 NGPU 覆盖
+  distributed_port: 29671
+  nprocs_per_node: 1
+
+task:
+  _name: av_hubert_pretraining
+  is_s2s: true
+  data: ???
+  label_dir: ???
+  tokenizer_bpe_model: ???
+  normalize: true                  # 必须与预训练一致
+  labels: ["wrd"]
+  single_target: true
+  fine_tuning: true
+  stack_order_audio: 4
+  tokenizer_bpe_name: sentencepiece
+  max_sample_size: 500
+  modalities: ["video"]            # ★ 仅视觉模态（题目硬性要求）
+  image_aug: true
+  pad_audio: true
+  random_crop: false
+  # 预解码帧缓存目录（见 scripts/build_frame_cache.py）。
+  # 实测：现解 mp4 约 16 ms/clip，是训练的瓶颈；全量 ROI 帧只有约 211 MB，
+  # 预解码后读取退化成 memcpy。设成目录路径即可启用，未命中会自动回退。
+  #   task.video_cache=/hy-tmp/lrs2_data/frame_cache
+  video_cache: null
+
+dataset:
+  num_workers: 8                   # 容器 CPU 配额 8 核；数据加载是单卡时的常见瓶颈
+  max_tokens: 4000                 # ★ 1000 → 4000：大 batch、少步数
+  max_tokens_valid: 2000           # 验证是纯前向，用小一点省显存
+  validate_after_updates: 0
+  validate_interval: 100           # ★ 实际上不再按 epoch 验证（不能填 0，会除零）
+  validate_interval_updates: 2000  # ★ 每 2000 步验证一次
+  train_subset: train
+  valid_subset: valid
+
+criterion:
+  _name: label_smoothed_cross_entropy
+  report_accuracy: true
+  label_smoothing: 0.1
+
+optimization:
+  max_update: 8000                 # ★ 30000 → 8000
+  lr: [0.002]                      # ★ batch ×4，按 sqrt 规则 0.001 → 0.002；不稳就调回 0.001
+  sentence_avg: true
+  update_freq: [1]
+  stop_time_hours: 0               # >0 时按累计训练小时数强制停止（兜底）
+
+optimizer:
+  _name: adam
+  adam_betas: (0.9,0.98)
+  adam_eps: 1e-08
+
+lr_scheduler:
+  _name: tri_stage
+  warmup_steps: 2000               # 保持官方 warmup:decay = 1:2 的比例
+  hold_steps: 0
+  decay_steps: 6000                # warmup 2000 + decay 6000 = max_update 8000
+  final_lr_scale: 0.05
+
+model:
+  _name: av_hubert_seq2seq
+  w2v_path: ???
+  apply_mask: false
+  mask_selection: static
+  mask_length: 10
+  mask_other: 0
+  mask_prob: 0.75
+  mask_channel_selection: static
+  mask_channel_length: 64
+  mask_channel_other: 0
+  mask_channel_prob: 0.5
+  layerdrop: 0.1
+  dropout: 0.0
+  activation_dropout: 0.1
+  attention_dropout: 0.0
+  feature_grad_mult: 1.0
+  # ---- 以下解码器尺寸 = 官方 base 默认值（AVHubertSeq2SeqConfig 的默认）----
+  decoder_layers: 6                # ★ 9 → 6（官方 base）
+  decoder_dropout: 0.1
+  decoder_attention_dropout: 0.0
+  decoder_activation_dropout: 0.1
+  freeze_finetune_updates: 8000    # ★ = max_update：编码器全程冻结，只训解码器
+  share_decoder_input_output_embed: true
+  decoder_normalize_before: true
+  decoder_embed_dim: 768           # ★ 1024 → 768（与 base 编码器一致，省掉投影层）
+  decoder_ffn_embed_dim: 3072      # ★ 4096 → 3072
+  decoder_attention_heads: 4       # ★ 8 → 4
+
+hydra:
+  job:
+    config:
+      override_dirname:
+        kv_sep: '-'
+        item_sep: '__'
+        exclude_keys:
+          - run
+          - task.data
+          - task.label_dir
+          - model.w2v_path
+          - dataset.train_subset
+          - dataset.valid_subset
+          - criterion.wer_kenlm_model
+          - criterion.wer_lexicon
+  run:
+    dir: ???
+  sweep:
+    dir: ???
+    subdir: ${hydra.job.config_name}__${hydra.job.override_dirname}

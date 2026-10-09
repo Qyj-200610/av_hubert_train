@@ -42,10 +42,72 @@ pip install \
 log "2. 安装数据预处理依赖"
 pip install \
   pydub==0.25.1 \
-  dlib==19.24.2 \
   scikit-video==1.1.11 \
   submitit==1.4.1 \
   jiwer==3.0.3
+
+# ---------------------------------------------------------------------------
+# 2b. dlib —— 单独处理，不要和上面混在一条命令里
+#
+# 为什么单独拿出来（实测踩过的坑）：
+#   * PyPI 上 dlib 只有 sdist，**没有任何 cp38-linux 预编译 wheel**，
+#     所以 `pip install dlib` 必然触发本地 C++ 编译，而编译常常失败。
+#   * 若把 dlib 和其它包写在同一条 pip 命令里，dlib 编译失败会**导致整条
+#     命令中止**，opencv / sentencepiece 等全部装不上（这个坑我踩过）。
+#   * 部分平台的 conda 只有 classic solver，`conda install -c conda-forge dlib`
+#     求解依赖树极慢（实测 >20 分钟不收敛），`--no-deps` 也仍会走求解阶段。
+#
+# 可靠做法：直接下载 conda-forge 的预编译包并解压（conda 包就是 bz2 归档），
+# 再用 apt 补齐它需要的 BLAS 动态库。
+# ---------------------------------------------------------------------------
+install_dlib_conda() {
+  local ENV_PREFIX
+  ENV_PREFIX="$(python -c 'import sys; print(sys.prefix)')"
+  local PYVER
+  PYVER="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  local PKG="dlib-19.24.2-py38h21aafda_0.tar.bz2"
+  local BASE="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/linux-64"
+  local FALLBACK="https://conda.anaconda.org/conda-forge/linux-64"
+
+  if python -c "import dlib" 2>/dev/null; then
+    echo "  dlib 已可用，跳过"
+    return 0
+  fi
+
+  echo "  用「下载 conda 包并解压」的方式安装 dlib（绕开求解器）"
+  local TMP
+  TMP="$(mktemp -d)"
+  # 注意 curl 必须带 --fail：否则镜像返回 404/5xx 时 curl 会把错误页写进 $PKG
+  # 并**返回 0**，于是下面 `||` 后的备用镜像永远不会被尝试，最后 tar 报"解压失败"，
+  # 把"镜像没有这个包"误导成"包坏了"。（fetch_dlib_models.sh 用的是 --fail，口径一致。）
+  # 这条注释必须放在 `( ... )` 之外：续行符 \ 后面紧跟注释会把 && 链切断（已踩过）。
+  ( cd "$TMP" \
+    && { curl -fsSL -o "$PKG" "$BASE/$PKG" || curl -fsSL -o "$PKG" "$FALLBACK/$PKG"; } \
+    && tar -xjf "$PKG" \
+    && cp -r lib/python${PYVER}/site-packages/* "$ENV_PREFIX/lib/python${PYVER}/site-packages/" ) \
+    || { echo "  dlib 包下载/解压失败（两个镜像都试过了；请检查网络或手工下载 $PKG）"; rm -rf "$TMP"; return 1; }
+  rm -rf "$TMP"
+
+  # 补齐 BLAS：dlib 的 .so 依赖 libcblas.so.3 / liblapack.so.3
+  # 注意 Ubuntu 20.04 上 libcblas3 已被 libatlas3-base 取代，后者正好提供这两个
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y libatlas3-base >/dev/null 2>&1 || true
+
+  if python -c "import dlib" 2>/dev/null; then
+    echo "  dlib 安装成功: $(python -c 'import dlib; print(dlib.__version__)')"
+    return 0
+  fi
+
+  echo "  dlib 仍不可用。诊断当前缺失的动态库："
+  local SO
+  SO="$(find "$ENV_PREFIX/lib/python${PYVER}/site-packages" -maxdepth 1 -name '_dlib*.so' | head -1)"
+  ldd "$SO" 2>/dev/null | grep -i 'not found' || echo "  (ldd 未见缺失)"
+  echo "  备选：pip install dlib==19.24.2（会本地编译，需 gcc + cmake）"
+  return 1
+}
+
+log "2b. 安装 dlib（绕开 pip 编译与 conda 求解）"
+install_dlib_conda || { echo "dlib 未装好；预处理脚本 detect_landmark.py / align_mouth.py 会失败"; }
 
 log "3. 编译安装 fairseq（这一步最慢，通常 5-15 分钟）"
 echo "numpy 版本（必须是 1.x）: $(python -c 'import numpy; print(numpy.__version__)')"
@@ -60,7 +122,8 @@ log "4. 自检"
 python - <<'PY'
 import importlib, sys
 mods = ['torch', 'torchaudio', 'fairseq', 'numpy', 'scipy', 'cv2',
-        'sentencepiece', 'editdistance', 'python_speech_features', 'skvideo']
+        'sentencepiece', 'editdistance', 'python_speech_features', 'skvideo',
+        'dlib']
 fail = []
 for m in mods:
     try:
