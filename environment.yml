@@ -84,7 +84,12 @@ dependencies:
       - editdistance==0.6.0
       # ---- 数据预处理（avhubert/preparation/requirements.txt）----
       - pydub==0.25.1
-      - dlib==19.24.2
+      # dlib 故意不放在这里：PyPI 上 dlib 只有 sdist、没有 cp38-linux wheel，
+      # `pip install dlib` 必然触发本地 C++ 编译且常常失败（一旦失败会让整条
+      # conda env create 中止）。请改用 conda-forge 的预编译包，
+      # scripts/setup_env.sh 里有现成做法（下载 dlib-*-py38*.tar.bz2 解压 +
+      # patchelf 写 rpath）。
+      # - dlib==19.24.2
       - scikit-video==1.1.11
       - submitit==1.4.1
       # ---- 聚类（仅在需要自己跑 k-means 时用）----

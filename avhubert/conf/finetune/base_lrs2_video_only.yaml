@@ -39,7 +39,12 @@ common:
   log_interval: 200
   tensorboard_logdir: tblog
   seed: 1337
-  user_dir: ???          # 启动时传 common.user_dir=$(pwd)，即 av_hubert 仓库根目录
+  user_dir: ???          # 启动时由 scripts/run_finetune.sh 传 ${REPO_ROOT}/avhubert
+                         # ★ 必须指向 **avhubert 包目录**，不是仓库根目录！
+                         #   原因：fairseq/utils.py:479 会 os.path.split(user_dir) 后
+                         #   import 最后一级目录名，必须是可导入的包（avhubert/ 的
+                         #   __init__.py 才注册 task/model）。传仓库根目录会报
+                         #   "Could not infer task type from {'_name': 'av_hubert_pretraining'...}"
 
 checkpoint:
   save_interval: 2       # 每 2 个 epoch 存一次

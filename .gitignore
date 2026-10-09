@@ -66,3 +66,7 @@ Thumbs.db
 !*.ini
 !.gitignore
 !.gitmodules
+
+# 由 scripts/make_full_config.py 自动生成（每次训练都会重写，文件头写着「请勿手改」）。
+# ★ 必须放在文件末尾：git 是「最后匹配的规则生效」，放在上面的 !*.yaml 之前会被否定规则覆盖。
+/avhubert/conf/finetune/_full_*.yaml

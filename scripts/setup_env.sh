@@ -109,9 +109,80 @@ install_dlib_conda() {
 log "2b. 安装 dlib（绕开 pip 编译与 conda 求解）"
 install_dlib_conda || { echo "dlib 未装好；预处理脚本 detect_landmark.py / align_mouth.py 会失败"; }
 
+# ---------------------------------------------------------------------------
+# 2c. 给 dlib 的 .so 写 rpath（否则报 GLIBCXX_3.4.29 缺失）
+#   系统 libstdc++ 过旧，而 conda 环境里那份够新。**正确做法是把路径写进 .so 的
+#   rpath**，而不是设全局 LD_LIBRARY_PATH —— 后者会让 /usr/bin/ffmpeg 去加载
+#   conda 里的 libffi/libncurses/libtinfo，报
+#   `undefined symbol: ffi_type_uint32` 直接崩掉（本项目实测踩过，
+#   pipeline 的第 3/4 步每一步都要调 ffmpeg）。
+# ---------------------------------------------------------------------------
+log "2c. 修正 dlib 的 rpath（用 patchelf，避免全局 LD_LIBRARY_PATH 反噬 ffmpeg）"
+python - <<'PY'
+import glob, os, subprocess, sys
+env_lib = os.path.join(sys.prefix, "lib")
+sos = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages", "dlib*.so"))
+sos += glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages", "dlib", "*.so"))
+if not sos:
+    print("  未找到 dlib 的 .so，跳过")
+    raise SystemExit(0)
+if subprocess.call(["which", "patchelf"], stdout=subprocess.DEVNULL) != 0:
+    print("  未安装 patchelf（apt install patchelf），跳过；若 import dlib 报 GLIBCXX 缺失请手动处理")
+    raise SystemExit(0)
+for so in sos:
+    subprocess.call(["patchelf", "--set-rpath", env_lib, so])
+    print("  已写入 rpath:", so)
+try:
+    import dlib
+    dlib.get_frontal_face_detector()
+    print("  dlib 导入与使用正常")
+except Exception as e:
+    print("  警告：dlib 仍不可用：%r（需要时再检查 libcblas/liblapack：apt install libatlas3-base）" % e)
+PY
+
 log "3. 编译安装 fairseq（这一步最慢，通常 5-15 分钟）"
 echo "numpy 版本（必须是 1.x）: $(python -c 'import numpy; print(numpy.__version__)')"
 pip install --editable ./fairseq
+
+# ---------------------------------------------------------------------------
+# 3b. ★ 把 hydra / omegaconf 钉到 fairseq 要求的版本（否则训练**根本起不来**）
+#
+# fairseq/setup.py 明确要求 `hydra-core<1.1`、`omegaconf<2.1`。
+# 但环境里如果被装成了新版（实测遇到过 hydra-core 1.3.7 + omegaconf 2.3.1），
+# 训练会在导入阶段就报：
+#     AttributeError: module 'omegaconf._utils' has no attribute 'is_primitive_type'
+# 原因是 fairseq 自己 monkey-patch 了 `omegaconf._utils.is_primitive_type`
+# （fairseq/dataclass/utils.py:373、checkpoint_utils.py:317），而 omegaconf ≥2.1
+# 删掉了这个属性。另外 Hydra ≥1.1 对配置头 `@package _group_` 的语义也变了，
+# 会让 AV-HuBERT 的配置全部失效（Key 'common' is not in struct）。
+#
+# 注意：不要用 `--no-deps` 手动塞 omegaconf —— 那会跳过兼容性检查，
+# 本项目的文档记录过"让 pip 自行解析依赖"反而装出不兼容的一组。
+# ---------------------------------------------------------------------------
+log "3b. 钉住 hydra-core / omegaconf 版本（fairseq 要求 <1.1 / <2.1）"
+pip install "hydra-core>=1.0.7,<1.1" "omegaconf>=2.0.5,<2.1"
+python -c "import hydra, omegaconf, omegaconf._utils as u; \
+print('  hydra', hydra.__version__, '| omegaconf', omegaconf.__version__, \
+'| is_primitive_type 存在:', hasattr(u, 'is_primitive_type'))"
+
+log "3c. numpy/skvideo 兼容垫片（np.float 在 numpy 1.24 被移除，skvideo 1.1.11 仍在用）"
+# sitecustomize.py 会在解释器启动时自动导入，把别名补回去。注意 conda 的
+# activate.d/ 下可能有**多个脚本写同一个文件**（本项目历史上有三份来源互相覆盖），
+# 因此这里显式重写一次，保证内容确定。
+SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"
+cat > "${SITE_PACKAGES}/sitecustomize.py" <<'PYEOF'
+# 兼容垫片：numpy>=1.24 移除了 np.float/np.int/np.bool 等别名，而 skvideo 1.1.11 仍在使用
+try:
+    import numpy as _np
+    for _name, _t in (("float", float), ("int", int), ("bool", bool),
+                      ("object", object), ("str", str), ("complex", complex)):
+        if not hasattr(_np, _name):
+            setattr(_np, _name, _t)
+except Exception:
+    pass
+PYEOF
+python -c "import numpy as np; print('  np.float 垫片生效:', hasattr(np, 'float'))"
+
 # 若编译报错，常见原因与对策：
 #   * numpy 2.x -> pip install "numpy<2"
 #   * 缺 nvcc / CUDA toolkit -> 设置 export CUDA_HOME=/usr/local/cuda

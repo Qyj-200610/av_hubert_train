@@ -1,0 +1,38 @@
+=== 1. 三类产物文件数（期望各 48164）===
+audio: 48164
+landmark: 48164
+video: 48164
+=== 2. 列表/计数行数 ===
+  48164 file.list
+  48164 split.list
+  48164 nframes.audio
+  48164 nframes.video
+ 192656 total
+=== 3. data 目录 ===
+dict.wrd.txt
+test.tsv
+test.wrd
+test_mv.tsv
+test_mv.wrd
+train.tsv
+train.wrd
+valid.tsv
+valid.wrd
+data 文件数: 9
+=== 4. train.tsv 首行与列数 ===
+/
+5535415699068794046/00001	/hy-tmp/lrs2_data/video/5535415699068794046/00001.mp4	/hy-tmp/lrs2_data/audio/5535415699068794046/00001.wav	35	22528
+第二行列数: 5
+=== 5. 词表 ===
+996 data/dict.wrd.txt
+=== 6. test_mv 条数 ===
+247 data/test_mv.tsv
+=== 7. 缺失清单 ===
+无 missing.list.*
+=== 8. 产物体积 ===
+3.3G	audio
+1.5G	landmark
+816M	video
+8.4M	data
+=== 9. 总帧数 ===
+总视频帧数: 2611599

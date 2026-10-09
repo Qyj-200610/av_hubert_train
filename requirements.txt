@@ -1,3 +1,8 @@
+# ⚠ 本文件是官方仓库留下的旧清单，**不要直接 pip install -r requirements.txt**：
+#   里面 opencv-python==4.5.4.60 / scipy==1.10.0 在 Python 3.8 上装不上，也没有列出
+#   torch/numpy/hydra/omegaconf。本项目的环境请用 environment.yml + scripts/setup_env.sh
+#   （后者还负责 dlib 的 conda 包安装、hydra/omegaconf 版本钉、dlib rpath、np.float 垫片）。
+#   已被 environment.yml 取代。
 python-speech-features==0.6
 scipy==1.10.0
 opencv-python==4.5.4.60

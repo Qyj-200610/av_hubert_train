@@ -1,3 +1,7 @@
+# 说明：本仓库里的 fairseq/ 实际是**普通提交的目录树**（860 个 mode 100644 文件），
+# 不是 git submodule —— `git ls-tree HEAD fairseq` 返回 tree 而非 commit，
+# `git submodule status` 也没有输出。下面这条声明是早期留下的，属于历史记录：
+# `git clone --recursive` / `git submodule update --init` 都不会有任何效果。
 [submodule "fairseq"]
 	path = fairseq
 	url = https://github.com/pytorch/fairseq

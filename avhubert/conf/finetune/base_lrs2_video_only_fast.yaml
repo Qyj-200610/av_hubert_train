@@ -49,7 +49,7 @@
 #    **曝光量基本不变，但优化步数少 3.75 倍**。
 #
 # 3) 编码器全程冻结：freeze_finetune_updates = max_update
-#    `AVHubertSeq2Seq.forward`（hubert_asr.py:493）在冻结期把编码器包在
+#    `AVHubertSeq2Seq.forward`（hubert_asr.py:495）在冻结期把编码器包在
 #    `torch.no_grad()` 里 → 省掉编码器的反向与激活显存，只训解码器。
 #    这是"砍掉相对不重要的训练"的主要取舍：编码器已由 LRS3+Vox 预训练成
 #    较强的唇读特征提取器，只适配解码器能拿到大部分收益，但**代码里从未解冻
@@ -88,8 +88,11 @@ common:
   user_dir: ???
 
 checkpoint:
-  save_interval: 1
-  save_interval_updates: 2000   # 与验证对齐，少存几次少占 I/O
+  save_interval: 50              # 注意：fairseq 是 `end_of_epoch and epoch % save_interval == 0`
+                                 # 时存盘，所以写 1 会**每个 epoch 都存一次**（每个 1.9 GB，
+                                 # 实测那次跑了 12 个 epoch 就写了 12 次）。写 50 让它实际上
+                                 # 只按下面的按步存盘走。
+  save_interval_updates: 2000    # 与验证对齐的按步存盘
   keep_interval_updates: 1
   no_epoch_checkpoints: true
   best_checkpoint_metric: accuracy
@@ -120,7 +123,10 @@ task:
   pad_audio: true
   random_crop: false
   # 预解码帧缓存目录（见 scripts/build_frame_cache.py）。
-  # 实测：现解 mp4 约 16 ms/clip，是训练的瓶颈；全量 ROI 帧只有约 211 MB，
+  # 实测：现解 mp4 约 16 ms/clip；全量 ROI 帧**约 24 GB**（2,611,599 帧 × 96×96 字节，
+  # 实测 frames.bin = 24.07 GB。早先这里写的「211 MB」是算错了——96×96 少乘了一次 96）。
+  # 另注：真实训练（CPU 空闲、在线解码）实测 0.33 秒/步且 GPU 利用率 100%,
+  # 说明该负载是 GPU 瓶颈，本缓存收益有限，属可选项。
   # 预解码后读取退化成 memcpy。设成目录路径即可启用，未命中会自动回退。
   #   task.video_cache=/hy-tmp/lrs2_data/frame_cache
   video_cache: null
@@ -184,7 +190,8 @@ model:
   freeze_finetune_updates: 8000    # ★ = max_update：编码器全程冻结，只训解码器
   share_decoder_input_output_embed: true
   decoder_normalize_before: true
-  decoder_embed_dim: 768           # ★ 1024 → 768（与 base 编码器一致，省掉投影层）
+  decoder_embed_dim: 768           # ★ 1024 → 768（必须等于编码器维度，否则 cross-attention 的
+                                   #   k_proj 尺寸不匹配、第一次前向就崩——见文件头 §1 的说明）
   decoder_ffn_embed_dim: 3072      # ★ 4096 → 3072
   decoder_attention_heads: 4       # ★ 8 → 4
 

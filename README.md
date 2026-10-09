@@ -7,19 +7,35 @@
 
 ---
 
+## ★ 复现结果（LRS2 test，纯视觉）
+
+| 评测口径 | 样本数 | beam | **WER** |
+| --- | --- | --- | --- |
+| **LRS2 `test`（全量，主口径）** | **1,243** | 10 | **52.97%** |
+| LRS2 `test_mv`（MV 子集） | 246 | 10 | **56.96%** |
+
+- 配置：官方 `base_vox_iter4.pt` + 纯视觉（`modalities: ["video"]`）、8,000 步微调、
+  编码器全程冻结、beam=10；单卡 RTX 3090 实测 **44.3 分钟**（0.33 秒/步）。
+- 全部结果、原始日志、WER 文件与逐句假设见 **[`results/`](results/)**；
+  任务要求格式的结果记录见 [`docs/复现结果.md`](docs/复现结果.md)。
+- 逐句层面：0 条空输出、14.6% 的句子完全正确、逐句中位 WER 50%（说明模型确实在做唇读）。
+- ⚠ 该结果使用的训练步数与编码器冻结策略都**比官方配方更省时**（官方为 45,000 步 +
+  后半程解冻编码器），因此 52.97% 应理解为"算力受限下的结果"，不是方法上限；
+  提升路径见 `results/02_微调与解码/配置与结果.md` §6。
+
 ## 1. 当前进度
 
 | 项目 | 状态 |
 | --- | --- |
-| 官方代码导入（av_hubert + fairseq 子模块，固定 commit） | ✅ 已完成 |
+| 官方代码导入（av_hubert + fairseq） | ✅ 已完成（注：`fairseq/` 是**普通提交的目录树**，不是 git submodule——`git ls-tree HEAD fairseq` 返回 tree 而非 commit，`.gitmodules` 里的声明在交付仓库里无法校验） |
 | 预训练权重下载（`base_vox_iter4.pt`，1.18 GB） | ✅ 已完成 |
 | LRS2 数据预处理脚本（`lrs2_prepare.py`） | ✅ 已完成 |
 | LRS2 manifest / 词表生成（`lrs2_manifest.py`） | ✅ 已完成 |
 | LRS2 finetune 配置（video-only：base + smoke） | ✅ 已完成 |
 | 环境规格（`environment.yml`）与一键脚本 | ✅ 已完成 |
-| LRS2 **main** 数据集下载（用题目给的地址，勿下完整版 LRS2） | ⬜ 待办 |
-| 租云 GPU + 创建 conda 环境 + 编译 fairseq | ⬜ 待办（见 [4.1](#41-为什么不在本机跑推荐路线租云-gpu)） |
-| 微调 + 测试 + 汇报 WER | ⬜ 待办 |
+| LRS2 **main** 数据集下载（用题目给的地址，勿下完整版 LRS2） | 已完成（48,164 条 clip） |
+| 租云 GPU + 创建 conda 环境 + 编译 fairseq | 已完成（恒源云 1×RTX 3090） |
+| 微调 + 测试 + 汇报 WER | 已完成：**LRS2 test 纯视觉 WER = 52.97%**（1,243 条，beam=10）；MV 子集 56.96%（246 条）。结果与原始产物见 `results/` |
 
 > **本机跑不了这个实验**（已实测，三条硬约束）：Windows + Python 3.12 装不了 fairseq
 > （新版 Python 拒绝其 dataclass 写法）；本机 RTX 5060 Laptop 是 **sm_120（Blackwell）**，
@@ -185,7 +201,7 @@ NGPU=1 bash scripts/run_finetune.sh train      # 单卡就写 1
 
 # ⑦ 测试并拿点数
 bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" test
-cat "$EXP/decode_test/wer.test"
+cat "$EXP/decode_test"/wer.*      # 文件名是 wer.<哈希>，不是 wer.test
 ```
 
 #### 实机环境记录（恒源云 RTX 3090 实例，已实测）
@@ -218,18 +234,19 @@ device capability   ->  (8, 6)   ==  sm_86   ✓ 在列表内
 #### 产物体积估算（决定 `/hy-tmp` 要多大）
 
 由 48,164 条 clip、平均单个 mp4 143 KB 反推：每条约 2 秒、约 500 kbps
-（125 KB / 2 s ≈ 500 kbps，× 48,164 ≈ 6.94 GB，与实测 6.77 GB 吻合）。
+（125 KB / 2 s ≈ 500 kbps，× 48,164 ≈ 6.94 GB）。实测 `main/` 目录 7,269,956,461 字节
+≈ **7.27 GB**（= 6.77 GiB，早先写「6.77 GB」是把 GiB 当成了 GB），48,165 个 mp4 + 48,165 个 txt。
 
 | 产物 | 估算体积 |
 | --- | --- |
-| 原始 `main/`（mp4+txt） | **6.77 GB**（实测） |
+| 原始 `main/`（mp4+txt） | **7.27 GB**（= 6.77 GiB，实测 7,269,956,461 字节） |
 | `audio/`（16 kHz mono wav） | ~3.1 GB |
-| `landmark/`（68 点 pkl） | ~1.3 GB |
-| `video/`（96×96 ROI mp4） | ~5–10 GB（取决于编码码率） |
+| `landmark/`（68 点 pkl） | **1.5 GB**（实测） |
+| `video/`（96×96 ROI mp4） | **816 MB**（实测，比预估小很多） |
 | manifest / 词表 | < 20 MB |
-| **合计** | **约 16–21 GB** |
+| **合计** | **约 12.4 GB**（实测：7.27 + 3.3 + 1.5 + 0.82 GB + manifest；早先预估 16–21 GB 偏大） |
 
-总帧数约 **240 万帧**。dlib 关键点检测**单进程实测约 0.45 it/s（2.2 s/clip）**，
+总帧数实测 **2,611,599 帧**（约 260 万）。dlib 关键点检测**单进程实测约 0.45 it/s（2.2 s/clip）**，
 串行跑完 48,164 条约需 **30 小时**——这是整条流水线的真正瓶颈，
 必须靠分片并行（`pipeline_lrs2.sh` 的 `all` 模式已改为阶段内 8 rank 并行，
 见 `docs/预处理并行化方案.md` 执行记录）。
@@ -237,7 +254,7 @@ device capability   ->  (8, 6)   ==  sm_86   ✓ 在列表内
 
 #### 数据上传的实测参数（重要，避免走弯路）
 
-把 6.77 GB 数据集传到实例，实测了几种方式：
+把 7.27 GB（6.77 GiB）数据集传到实例，实测了几种方式：
 
 | 方式 | 吞吐 | 结论 |
 | --- | --- | --- |
@@ -423,7 +440,8 @@ head -3 main/5535415699068794046/00001.txt
 
 > **实测记录（本考核数据集）**：
 > - 布局：`main/<video_id>/<clip_id>.mp4`，两层扁平，**无划分子目录**
-> - 规模：48,165 个 mp4 + 48,165 个 txt，合计约 **6.93 GB**
+> - 规模：48,165 个 mp4 + 48,165 个 txt（合计 7.27 GB）；三个列表合计 48,164 条，
+>   多出的 1 条（`6375923619026758902/00013`）未被任何列表引用，故产物为 48,164 条
 > - 与 datalist 一致性：`train+val+test = 45,839 + 1,082 + 1,243 = 48,164` 条，**逐条核对全部命中，0 缺失**
 > - 标注格式：`.txt` 内容为 `Text:  <英文转写>` + `Conf:  <置信度>`，解析后得到干净转写
 > - 因此 `--layout` 默认值设为 `flat`；若你的数据带划分子目录请显式加 `--layout split`
@@ -555,7 +573,9 @@ bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" te
 
 ## 8. 已知风险与后续事项
 
-1. **算力**：LRS2 main 训练集约 100+ 小时音频量，`base` 模型 8 卡微调约需数天。
+1. **算力**：LRS2 main 训练集 45,839 条 ≈ **29 小时**（不是「100+ 小时」）。实测口径：
+   **单卡 RTX 3090，8,000 步微调只用 44.3 分钟**（0.33 秒/步）；按官方 base 配方
+   （45,000 步 + 后半程解冻编码器）估约 4–6 小时。
    算力有限时可降低 `optimization.max_update`（如 10000），或先用 `--max-train` 跑子集。
 2. **本机无法运行**（已实测，详见 [4.1](#41-为什么不在本机跑推荐路线租云-gpu)）：
    Python 3.12 导入 fairseq 直接报错；本机 sm_120 显卡不被 `torch 1.13.1+cu117` 支持；

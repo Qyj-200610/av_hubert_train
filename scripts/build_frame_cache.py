@@ -179,19 +179,34 @@ def main():
     assert len(heights) == 1 and len(widths) == 1, \
         "帧尺寸不一致：%s / %s" % (heights, widths)
 
-    np.savez(
-        tmp_index_path,
-        keys=np.array(keys),
-        offsets=np.array(offsets, dtype=np.int64),
-        lengths=np.array(lengths, dtype=np.int64),
-        heights=np.full(len(keys), heights.pop(), dtype=np.int64),
-        widths=np.full(len(keys), widths.pop(), dtype=np.int64),
-        # 把 bin 的实际字节数写进索引：读取端据此校验"索引与 bin 是否配套"，
-        # 避免用到不完整/不匹配的一对文件
-        bin_size=np.int64(offset),
-        n_frames=np.int64(sum(lengths)),
-    )
+    # ---- 原子发布索引 ----
+    # 坑（实测踩过，而且正是它让"原子发布"这版修复失效）：
+    #   np.savez(<**字符串**文件名>, ...) 在文件名不以 .npz 结尾时会**自动追加 .npz**。
+    #   原来写的是 index_path + ".tmp" = "index.npz.tmp"，于是 numpy 实际写出的是
+    #   "index.npz.tmp.npz"，紧跟的 os.replace("index.npz.tmp", "index.npz") 必然
+    #   FileNotFoundError → 整个缓存构建中止 → 训练静默回退到在线解码（真的发生过：
+    #   见 results/04_原始产物/训练与评测_全流程日志.log 里的
+    #   "警告：帧缓存构建失败，改为在线解码继续训练"）。
+    #   修法：传**文件对象**给 np.savez —— 这时 numpy 不会动文件名。
+    tmp_index_path = index_path + ".partial"
+    with open(tmp_index_path, "wb") as fh:
+        np.savez(
+            fh,
+            keys=np.array(keys),
+            offsets=np.array(offsets, dtype=np.int64),
+            lengths=np.array(lengths, dtype=np.int64),
+            heights=np.full(len(keys), heights.pop(), dtype=np.int64),
+            widths=np.full(len(keys), widths.pop(), dtype=np.int64),
+            # 把 bin 的实际字节数写进索引：读取端据此校验"索引与 bin 是否配套"，
+            # 避免用到不完整/不匹配的一对文件
+            bin_size=np.int64(offset),
+            n_frames=np.int64(sum(lengths)),
+        )
     os.replace(tmp_index_path, index_path)   # 原子发布
+
+    if not os.path.isfile(index_path):
+        print("错误：索引发布失败，%s 不存在" % index_path)
+        return 1
 
     total_frames = int(sum(lengths))
     print("完成：%d 条 clip / %d 帧 / %.1f MB / %.1f 秒（%.1f clips/s）"
