@@ -28,6 +28,15 @@ python -c "import sys; print('executable:', sys.executable)"
 if [[ "${CONDA_DEFAULT_ENV:-}" != "avhubert" ]]; then
   echo "⚠️  当前 conda 环境是 '${CONDA_DEFAULT_ENV:-<无>}'，建议先 conda activate avhubert"
 fi
+# Python 版本是**承重**的：fairseq 这个 commit 只兼容 3.8–3.10，而 3.12 会直接
+# 在 dataclass 定义处报 "mutable default ... is not allowed"。原来只警告环境名，
+# 不校验版本，于是装到一半才失败（而且报错信息看着像 fairseq 的问题）。
+if ! python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 8) else 1)'; then
+  echo "错误：本项目的环境固定为 Python 3.8（environment.yml 里已钉死），" >&2
+  echo "      当前是 $(python -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')。" >&2
+  echo "      请 conda env create -f environment.yml && conda activate avhubert 后重试。" >&2
+  exit 1
+fi
 
 log "1. 安装 av_hubert 的 pip 依赖"
 # 注意：不要直接 pip install -r requirements.txt —— 里面的 opencv-python==4.5.4.60
@@ -182,6 +191,12 @@ except Exception:
     pass
 PYEOF
 python -c "import numpy as np; print('  np.float 垫片生效:', hasattr(np, 'float'))"
+echo "  ⚠️ 提醒：这是一个写在 site-packages 里的**全局**垫片（sitecustomize.py），"
+echo "    对整个环境里的所有 Python 代码生效，不只 skvideo。它会让"
+echo "    'np.float 不存在' 这个版本不兼容问题被掩盖掉；"
+echo "    更干净的做法是把 numpy 钉在 <1.24（environment.yml 已经这么做），"
+echo "    或者只在 detect_landmark.py 里做局部 shim。"
+echo "    另外：若将来升级到 numpy 2.x，这个垫片可能带来难以定位的行为差异。"
 
 # 若编译报错，常见原因与对策：
 #   * numpy 2.x -> pip install "numpy<2"

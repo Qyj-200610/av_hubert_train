@@ -13,10 +13,18 @@
 #   export DLIB=/path/to/dlib_models             # dlib 模型目录
 #   export NSHARD=8                              # 并行分片数
 #   export MODALITY=video                        # video（默认，纯视觉）| av（音视频）
+#   export WARP_BACKEND=cv2                      # cv2（默认，快 4.4x）| skimage（官方）
+#   export WRITE_BACKEND=pipe                    # pipe（默认）| png（官方逐帧 PNG）
 #   bash scripts/pipeline_lrs2.sh all
 #
 # 也可单独执行某一步：
 #   bash scripts/pipeline_lrs2.sh prepare|audio|landmark|mouth|frames|manifest
+#
+# 关于 WARP_BACKEND / WRITE_BACKEND：
+#   默认的 cv2 + pipe 是经过逐位校验的快路径（解码前 ROI 帧平均差 0.5 灰度级，
+#   经 h264 后产物层面平均差 2.26 灰度级 ≈ 0.9%，与压缩噪声同量级）。
+#   若要产出与官方预处理**逐位可比**的 ROI，设
+#   WARP_BACKEND=skimage WRITE_BACKEND=png（这一阶段会从 37 分钟回到 1.5 小时以上）。
 #
 # 关于 MODALITY（很重要，直接关系耗时）：
 #   本题要求「仅使用视觉模态」。纯视觉训练**不会读取音频 wav**
@@ -55,6 +63,21 @@ case "${MODALITY}" in
   video) VIDEO_ONLY_ARG=(--video-only) ;;
   av)    VIDEO_ONLY_ARG=() ;;
   *)     echo "错误：MODALITY 只能是 video 或 av（当前：${MODALITY}）" >&2; exit 2 ;;
+esac
+
+# 唇部 ROI 的两个后端开关。默认是经过实测校验的快路径；设成
+#   WARP_BACKEND=skimage WRITE_BACKEND=png
+# 即可完全退回官方实现（产物与官方预处理逐位可比），无需改脚本。
+# 默认值与 align_mouth.py 里 argparse 的默认值保持一致。
+: "${WARP_BACKEND:=cv2}"
+: "${WRITE_BACKEND:=pipe}"
+case "${WARP_BACKEND}" in
+  cv2|skimage) ;;
+  *) echo "错误：WARP_BACKEND 只能是 cv2 或 skimage（当前：${WARP_BACKEND}）" >&2; exit 2 ;;
+esac
+case "${WRITE_BACKEND}" in
+  pipe|png) ;;
+  *) echo "错误：WRITE_BACKEND 只能是 pipe 或 png（当前：${WRITE_BACKEND}）" >&2; exit 2 ;;
 esac
 
 # 需要两个 dlib 模型（bzip2 解压后使用）+ 一个参考平均脸：
@@ -219,7 +242,7 @@ step_landmark() {
 
 # ---------- 4. 对齐并裁出嘴部 ROI ----------
 step_mouth() {
-  log "step 4/6  裁切嘴部 ROI -> ${WORK}/video"
+  log "step 4/6  裁切嘴部 ROI -> ${WORK}/video（warp=${WARP_BACKEND}, write=${WRITE_BACKEND}）"
   local rank="${1:-0}"
   [[ -f "${MEAN_FACE}" ]] || { echo "缺少参考平均脸: ${MEAN_FACE}（可运行 scripts/fetch_dlib_models.sh 下载）"; exit 1; }
   # 注意：--video-direc 必须是 LRS2 根目录，脚本内部按 {video-direc}/{fid}.mp4 取原始视频
@@ -230,6 +253,8 @@ step_mouth() {
     --save-direc    "${WORK}/video" \
     --mean-face     "${MEAN_FACE}" \
     --ffmpeg        "${FFMPEG}" \
+    --warp-backend  "${WARP_BACKEND}" \
+    --write-backend "${WRITE_BACKEND}" \
     --rank          "${rank}" \
     --nshard        "${NSHARD}"
 }
@@ -242,6 +267,11 @@ step_frames() {
   # rm -rf 整个 WORK —— 那会把没有续跑逻辑、最慢的关键点阶段一起丢掉。
   # 所以每轮开始先清干净。
   rm -f "${WORK}"/missing.list.*
+  # 同理清掉上一轮的 per-rank 帧数文件：count_frames.py 是直接写最终文件名的，
+  # 某个 rank 在写之前被 kill 就会留下**上一轮**的 nframes.*.<rank>，
+  # 下面的存在性检查照样通过，于是把过期帧数并进 nframes.*（长度对、内容错，
+  # 后续 lrs2_manifest 的长度交叉校验抓不到）。
+  rm -f "${WORK}"/nframes.audio.* "${WORK}"/nframes.video.*
   for ((r=0; r<NSHARD; r++)); do
     python "${PREP}/count_frames.py" \
       --root     "${WORK}" \
@@ -280,6 +310,24 @@ step_manifest() {
     --work-dir   "${WORK}" \
     --datalist   "${DATALIST}" \
     --vocab-size "${VOCAB_SIZE:-1000}"
+}
+
+# ---------- 7. 全量完整性验收 ----------
+# scripts/verify_dataset.py 校验的是 manifest 的**核心契约**：
+#   tsv 里的视频帧数 == landmark 条数 == ROI 实际帧数
+# 这三者一旦不一致，训练**不会报错**，只会静默用错长度的样本或错的分批。
+# 这个脚本原来只被文档提到、没有任何脚本调用它，所以"一键复跑"里缺了这道验收。
+step_verify() {
+  log "step 7/7  全量完整性验收（verify_dataset.py）"
+  [[ -f "${WORK}/nframes.video" ]] || {
+    echo "跳过验收：${WORK}/nframes.video 不存在（先跑 frames 步骤）" >&2; return 0; }
+  local vargs=()
+  [[ -n "${VERIFY_LIMIT:-}" ]] && vargs=(--limit "${VERIFY_LIMIT}")
+  # 用绝对路径：本脚本不依赖 cwd（其余步骤也都用 ${PREP} 绝对路径）
+  python "${REPO_ROOT}/scripts/verify_dataset.py" \
+    --work-dir "${WORK}" \
+    --workers  "${NSHARD}" \
+    ${vargs[@]+"${vargs[@]}"}
 }
 
 # ---------- 并行调度：同一阶段的所有 rank 同时跑，并逐个检查退出码 ----------
@@ -338,9 +386,11 @@ case "${1:-all}" in
 
     step_frames
     step_manifest
+    step_verify
     ;;
+  verify)   step_verify ;;
   *)
-    echo "用法: bash scripts/pipeline_lrs2.sh [all|prepare|audio|landmark|mouth|frames|manifest] [rank]"
+    echo "用法: bash scripts/pipeline_lrs2.sh [all|prepare|audio|landmark|mouth|frames|manifest|verify] [rank]"
     exit 1
     ;;
 esac

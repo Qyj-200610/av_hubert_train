@@ -93,7 +93,7 @@ av_hubert_train/
 │   └── base_vox_iter4.pt         # 已下载的预训练权重（本地保留，云上可重新下载）
 ├── scripts/                      # ★ 新增：本项目脚本
 │   ├── check_gpu_compat.py       # 租到云 GPU 后先跑这个，验证算力 sm_XX 是否被 torch 支持
-│   ├── pipeline_lrs2.sh          # 数据流水线（6 步）
+│   ├── pipeline_lrs2.sh          # 数据流水线（7 步，纯视觉模式下第 2 步跳过）
 │   ├── run_finetune.sh           # 冒烟 / 微调 / 测试
 │   ├── setup_env.sh              # 安装依赖 + 编译 fairseq 扩展
 │   └── fetch_dlib_models.sh      # 下载 dlib 模型与参考平均脸
@@ -269,7 +269,8 @@ device capability   ->  (8, 6)   ==  sm_86   ✓ 在列表内
 2. **并行连接无收益**：带宽瓶颈在链路上，2 连接合计与单连接相同
 3. **并发连接数过高会被网关拒绝**（`Error reading SSH protocol banner`）。
    实测 8 连接时全部握手失败，且之后连单连接也会被短暂拒绝，
-   **不要开 8 条以上连接**；用 `parallel_upload.py --conns 1` 即可
+   **不要开 8 条以上连接**；用 `python scripts/remote/parallel_upload.py --conns 1` 即可
+   （该脚本已废弃，保留仅为记录这次实测；上传/取文件建议直接用平台自带的 oss 工具）
 
 另外注意：**实例下行很快（实测清华镜像 60 MB/s），慢的只有「本机→实例」这条路**。
 如果数据已存在于平台侧（个人数据 / 公网），让实例自己去拉会快得多。
@@ -481,20 +482,30 @@ export NSHARD=8                              # 并行分片数：**看 cgroup �
                                              # （cpu.cfs_quota_us/cpu.cfs_period_us = 800000/100000）
                                              # 设成 64 只会增加上下文切换，不会更快
 export LAYOUT=flat                           # 本考核数据集为 flat；带划分子目录时改 split
+export MODALITY=video                        # **默认值**：纯视觉，跳过第 2 步抽音频
+                                             # （省约 1 小时 + 3.3 GB）；要音视频请设 av
+export WARP_BACKEND=cv2 WRITE_BACKEND=pipe   # **默认值**：唇部 ROI 的快路径
+                                             # 要产出与官方逐位可比的 ROI，设
+                                             # WARP_BACKEND=skimage WRITE_BACKEND=png
 
 bash scripts/fetch_dlib_models.sh "$DLIB"    # 下载 dlib 模型 + 20words_mean_face.npy
 bash scripts/pipeline_lrs2.sh all
 ```
 
-流水线共 6 步：
+流水线共 7 步（第 2 步在纯视觉模式下会整步跳过）：
 
 1. `lrs2_prepare.py` —— 解析三个列表 → `file.list` / `label.list` / `split.list`
    （严格校验缺标注 / 缺 mp4；`split.list` 记录每条的划分归属，flat 布局必需）
 2. 抽音频 —— ffmpeg 转 16 kHz 单声道 wav 到 `$WORK/audio/`
-3. `detect_landmark.py` —— dlib 68 点关键点 → `$WORK/landmark/`
+   （**`MODALITY=video` 时整步跳过**：纯视觉训练从不读 wav，见
+   `results/01_预处理/验收与时间线.md` §3）
+3. `detect_landmark.py` —— dlib 68 点关键点 → `$WORK/landmark/`（支持断点续跑）
 4. `align_mouth.py` —— 相似变换对齐 + 裁 96×96 嘴部 ROI → `$WORK/video/`
 5. `count_frames.py` —— 统计帧数 → `nframes.audio` / `nframes.video`
 6. `lrs2_manifest.py` —— 生成 `{train,valid,test}.{tsv,wrd}` + `dict.wrd.txt` + spm 词表
+7. `verify_dataset.py` —— **全量完整性验收**：逐条核对
+   `tsv 视频帧数 == landmark 条数 == ROI 实际帧数`、ROI 尺寸、重复 id、
+   train/valid/test 交集、`test_mv ⊆ test`，并报告"整段无脸"的 clip 数
 
 产出位于 `$WORK/data/`。**注意 `nframes.*` 必须与 `file.list` 顺序严格一致**
 （`count_frames.py` 按分片写出，需按 rank 顺序拼接，流水线已处理）。
@@ -533,7 +544,10 @@ bash scripts/run_finetune.sh test "$EXP/train/checkpoints/checkpoint_best.pt" te
 - `model.w2v_path` —— 预训练权重；模型会从 checkpoint 内部读取预训练的 `cfg.model`
   （含 `model.label_rate=25` 等），因此**不需要**额外的预训练配置
 - `dataset.valid_subset: valid` —— 对应 `valid.tsv`（即 LRS2 的 val 划分）
-- `max_update: 30000`、`freeze_finetune_updates: 30000` —— 沿用官方 433h 设置
+- `max_update: 45000`、`freeze_finetune_updates: 22500` —— 与官方 base 配方
+  （`conf/finetune/base_vox_433h.yaml`）一致：总 45000 步，**前一半冻结编码器、后一半解冻**。
+  （注：交付时实际跑的是省时版 `base_lrs2_video_only_fast.yaml`：8000 步 + 编码器全程冻结，
+  见 `results/02_微调与解码/配置与结果.md` §2。）
 
 ### 解码（官方命令，注意入口名）
 

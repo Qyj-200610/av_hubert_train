@@ -25,6 +25,9 @@
 # =============================================================================
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DEFAULT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # ---------------------------------------------------------------------------
 # 先把调用方传进来的覆盖值存起来，再 source 环境文件。
 # 坑（实测踩过）：avh_env.sh 里 export 了 WORK / REPO 等同名变量，
@@ -44,15 +47,24 @@ _OVR_BEAM="${BEAM:-}"
 _OVR_EXTRA="${EXTRA:-}"
 _OVR_WAIT="${WAIT_TIMEOUT_H:-}"
 
-# 坑 2（实测踩过，启动即失败）：本脚本开着 `set -u`，而 /hy-tmp/avh_env.sh 第 4 行
-# 是 `export PYTHONPATH=...:${PYTHONPATH}` —— 非交互 shell 里 PYTHONPATH 未定义，
+# 坑 2（实测踩过，启动即失败）：本脚本开着 `set -u`，而环境文件里可能有
+# `export PYTHONPATH=...:${PYTHONPATH}` —— 非交互 shell 里 PYTHONPATH 未定义，
 # 于是 source 直接报 "PYTHONPATH: unbound variable" 并中断整个脚本。
 # 所以 source 期间临时关掉 -u（第三方环境文件不该假设调用方的 shell 选项）。
-set +u
-source /hy-tmp/avh_env.sh
-set -u
+#
+# 环境文件路径可用 AVH_ENV 覆盖；**文件不存在时会跳过**（原实现无条件 source，
+# 换一台机器/换一个目录就会让脚本带着错误默认值继续跑）。
+AVH_ENV="${AVH_ENV:-/hy-tmp/avh_env.sh}"
+if [[ -f "${AVH_ENV}" ]]; then
+  set +u
+  # shellcheck disable=SC1090
+  source "${AVH_ENV}"
+  set -u
+else
+  echo "[提示] 未找到环境文件 ${AVH_ENV}，按命令行/默认值继续（模板见 scripts/avh_env.example.sh）"
+fi
 
-REPO="${_OVR_REPO:-${REPO:-/hy-tmp/av_hubert_train}}"
+REPO="${_OVR_REPO:-${REPO:-${REPO_DEFAULT}}}"
 WORK="${_OVR_WORK:-${WORK:-/hy-tmp/lrs2_data}}"
 EXP="${_OVR_EXP:-${EXP:-/hy-tmp/exp}}"
 CKPT="${_OVR_CKPT:-${CKPT:-${REPO}/pretrained/base_vox_iter4.pt}}"
@@ -83,20 +95,32 @@ log "==== 1/4 等待预处理完成 ===="
 deadline=$(( $(date +%s) + WAIT_TIMEOUT_H * 3600 ))
 need=$(wc -l < "${WORK}/file.list" 2>/dev/null || echo 0)
 log "file.list 需要 ${need} 条"
+
+# 预处理"真正完成"的判据：三个 split 的 tsv + 词表都要在。
+# 只看 train.tsv 是不够的——流水线可能在写完 train.tsv 之后、生成
+# dict.wrd.txt / test_mv.* 之前才死掉，那样必须判为失败而不是继续等。
+_complete() {
+  [[ -f "${WORK}/data/train.tsv" && -f "${WORK}/data/valid.tsv" \
+     && -f "${WORK}/data/test.tsv" && -f "${WORK}/data/dict.wrd.txt" ]]
+}
+
 while true; do
   n_video=$(find "${WORK}/video" -type f 2>/dev/null | wc -l)
-  if [[ "${n_video}" -ge "${need}" && "${need}" -gt 0 \
-        && -f "${WORK}/data/train.tsv" && -f "${WORK}/data/valid.tsv" && -f "${WORK}/data/test.tsv" ]]; then
-    log "预处理完成：video=${n_video} / ${need}，data/*.tsv 齐备"
+  if [[ "${n_video}" -ge "${need}" && "${need}" -gt 0 ]] && _complete; then
+    log "预处理完成：video=${n_video} / ${need}，data/{train,valid,test}.tsv + dict.wrd.txt 齐备"
     break
   fi
   # 失败检测：流水线进程没了、但产物还没齐 -> 不干等
+  # （原实现把这条判据挂在"train.tsv 不存在"上，于是"写完 train.tsv 之后才死"
+  #   的情况检测不到，会一直 sleep 到 WAIT_TIMEOUT_H（默认 12 小时）才退出。）
   if ! pgrep -f "[p]ipeline_lrs2" >/dev/null 2>&1; then
     sleep 20   # 给 step5/6 一点时间收尾
-    if ! pgrep -f "[p]ipeline_lrs2" >/dev/null 2>&1 \
-       && [[ ! -f "${WORK}/data/train.tsv" ]]; then
-      log "错误：预处理进程已退出，但 data/train.tsv 不存在（video=${n_video}/${need}）"
-      log "请检查 /hy-tmp/pipeline_parallel.log 尾部的错误信息。中止。"
+    if ! pgrep -f "[p]ipeline_lrs2" >/dev/null 2>&1 && ! _complete; then
+      log "错误：预处理进程已退出，但产物不齐（video=${n_video}/${need}）"
+      for f in train.tsv valid.tsv test.tsv dict.wrd.txt; do
+        log "  data/${f}: $([[ -f "${WORK}/data/${f}" ]] && echo 有 || echo 缺)"
+      done
+      log "请检查流水线日志尾部的错误信息。中止。"
       exit 2
     fi
   fi
@@ -112,7 +136,7 @@ log "产物清点："
 for d in audio landmark video; do log "  ${d}: $(find "${WORK}/${d}" -type f | wc -l)"; done
 log "  nframes.audio=$(wc -l < "${WORK}/nframes.audio" 2>/dev/null) nframes.video=$(wc -l < "${WORK}/nframes.video" 2>/dev/null)"
 log "  data/: $(ls "${WORK}/data" | wc -l) 项"
-df -BG --output=avail /hy-tmp | tail -1
+df -BG --output=avail "${WORK}" 2>/dev/null | tail -1 || true
 
 # ---------------------------------------------------------------------------
 # 2. 构建预解码帧缓存（可关）
@@ -122,7 +146,12 @@ if [[ "${NO_CACHE}" == "1" ]]; then
   log "==== 2/4 跳过帧缓存（NO_CACHE=1）===="
 else
   log "==== 2/4 构建预解码帧缓存 ===="
+  # 每个 tsv 的第 1 行是 root 行（"/"），不是缓存键；索引里的 keys 只含数据行。
+  # 不减掉这 3 行的话 have_n(48164) >= need_n(48167) 永远为假，
+  # "复用已有缓存"就成了死代码 —— 每次运行都会重建 24 GB 缓存。
   need_n=$(cat "${WORK}"/data/{train,valid,test}.tsv 2>/dev/null | wc -l)
+  need_n=$(( need_n - 3 ))
+  [[ "${need_n}" -lt 0 ]] && need_n=0
   have_n=0
   if [[ -f "${CACHE}/index.npz" ]]; then
     have_n=$(python - "${CACHE}/index.npz" <<'PY'
@@ -143,11 +172,17 @@ PY
     if [[ -f "${CACHE}/index.npz" ]]; then
       log "  已有缓存只覆盖 ${have_n} 条，少于需要的 ${need_n} 条，重建"
     fi
-    if python scripts/build_frame_cache.py --work-dir "${WORK}" --out "${CACHE}" \
-            --workers 8 --verify 30; then
+    python scripts/build_frame_cache.py --work-dir "${WORK}" --out "${CACHE}" \
+            --workers "${CACHE_WORKERS:-8}" --verify "${CACHE_VERIFY:-30}"
+    bc_rc=$?
+    if [[ "${bc_rc}" -eq 0 ]]; then
       log "  帧缓存构建并校验通过"
+    elif [[ "${bc_rc}" -eq 2 ]]; then
+      # 退出码 2 是"逐位校验失败"，产物不可信，与"构建失败"要分开说
+      log "  错误：帧缓存逐位校验失败（rc=2），产物不可信，改为在线解码继续训练"
+      NO_CACHE=1
     else
-      log "  警告：帧缓存构建失败，改为在线解码继续训练（只是慢一些）"
+      log "  警告：帧缓存构建失败（rc=${bc_rc}），改为在线解码继续训练（只是慢一些）"
       NO_CACHE=1
     fi
   fi

@@ -48,7 +48,8 @@ KNOWN_GPUS = [
     ('RTX 3090', 'sm_86'),
     ('RTX 4090', 'sm_89'),
     ('H100', 'sm_90'),
-    ('RTX 50 系 / B100', 'sm_120'),
+    ('B100 / B200', 'sm_100'),      # Blackwell 数据中心卡是 sm_100，不是 sm_120
+    ('RTX 50 系 (Blackwell)', 'sm_120'),
 ]
 # torch 1.13.1+cu117 的典型架构列表
 TORCH_113_ARCHS = ['sm_37', 'sm_50', 'sm_60', 'sm_61', 'sm_70', 'sm_75', 'sm_80', 'sm_86']
@@ -101,6 +102,17 @@ def main():
               % (i, torch.cuda.get_device_name(i),
                  torch.cuda.get_device_properties(i).total_memory / 1024 ** 3))
 
+    # 逐张卡判：异构机器上只看 0 号卡会误判（例如 0 号是 V100、1 号是新卡）
+    print()
+    print('  逐卡算力是否在 torch 架构列表内：')
+    caps = {}
+    for i in range(n):
+        c = torch.cuda.get_device_capability(i)
+        s = 'sm_%d%d' % c
+        caps[i] = s
+        mark = OK + '✓' + END if s in arch_list else BAD + '✗' + END
+        print('    [%d] %-28s %-7s %s' % (i, torch.cuda.get_device_name(i)[:28], s, mark))
+
     cap = torch.cuda.get_device_capability(0)
     sm = 'sm_%d%d' % cap
     print()
@@ -109,10 +121,13 @@ def main():
     # ---------------- 结论 ----------------
     print()
     print('=' * 70)
-    supported = sm in arch_list
+    # 只要**每一张**可见卡都受支持才算通过（训练脚本默认用 CUDA_VISIBLE_DEVICES 选卡）
+    unsupported = sorted({s for s in caps.values() if s not in arch_list})
+    supported = not unsupported
 
     if supported:
-        print(OK + '✓ 通过：本卡算力 %s 在 torch 的架构列表内，可以开始跑实验。' % sm + END)
+        print(OK + '✓ 通过：全部 %d 张卡的算力 %s 都在 torch 的架构列表内，可以开始跑实验。'
+              % (n, ', '.join(sorted(set(caps.values())))) + END)
         print()
         print('  下一步：')
         print('    export LRS2_ROOT=... DATALIST=... WORK=... FFMPEG=$(which ffmpeg) DLIB=...')
@@ -120,13 +135,14 @@ def main():
         print('    bash scripts/pipeline_lrs2.sh prepare   # 先验证数据列表能对上')
         return 0
 
-    print(BAD + '✗ 不通过：本卡算力 %s 不在 torch 的架构列表内，kernel 无法执行。' % sm + END)
+    print(BAD + '✗ 不通过：算力 %s 不在 torch 的架构列表内，kernel 无法执行。'
+          % ', '.join(unsupported) + END)
     print()
     print('  这不是环境装错，而是「卡太新、torch 太老」。换卡，不要往下跑。')
     print()
     print(DIM + '  本卡算力对照与建议：' + END)
     for name, smn in KNOWN_GPUS:
-        if smn == sm:
+        if smn in unsupported:
             mark = '  <- 就是这张'
         else:
             mark = ''

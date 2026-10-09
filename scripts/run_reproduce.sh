@@ -48,16 +48,17 @@ fi
 MODE="${1:-full}"
 WORK="${_OVR_WORK:-${WORK:-/hy-tmp/lrs2_data}}"
 EXP="${_OVR_EXP:-${EXP:-/hy-tmp/exp}}"
-MODALITY="${_OVR_MODALITY:-video}"
-MAX_UPDATE="${_OVR_MAX_UPDATE:-8000}"
-BEAM="${_OVR_BEAM:-10}"
+MODALITY="${_OVR_MODALITY:-${MODALITY:-video}}"
+MAX_UPDATE="${_OVR_MAX_UPDATE:-${MAX_UPDATE:-8000}}"
+BEAM="${_OVR_BEAM:-${BEAM:-10}}"
 NSHARD="${_OVR_NSHARD:-${NSHARD:-8}}"
 LRS2_ROOT="${_OVR_LRS2_ROOT:-${LRS2_ROOT:-}}"
 DATALIST="${_OVR_DATALIST:-${DATALIST:-}}"
 DLIB="${_OVR_DLIB:-${DLIB:-${WORK}/dlib}}"
-FFMPEG="${FFMPEG:-/usr/bin/ffmpeg}"
+# ffmpeg：优先用环境变量，其次从 PATH 找（写死 /usr/bin/ffmpeg 在别的机器上会
+# 拿到不存在的路径，而 environment.yml 装的是 conda 的 ffmpeg=4.4）
+FFMPEG="${FFMPEG:-$(command -v ffmpeg 2>/dev/null || echo /usr/bin/ffmpeg)}"
 CKPT="${CKPT:-${REPO_ROOT}/pretrained/base_vox_iter4.pt}"
-NEW_TEST_SET="${NEW_TEST_SET:-1}"      # 1 = 重新评测（不自动续跑旧 checkpoint）
 
 log() { echo -e "\n\033[1;36m==== $* ====\033[0m"; }
 
@@ -66,20 +67,27 @@ cd "${REPO_ROOT}" || exit 1
 [[ -n "${LRS2_ROOT}" && -n "${DATALIST}" ]] || {
   echo "请先 export LRS2_ROOT=<LRS2 main 目录> 与 DATALIST=<lrs2_datalist 目录>" >&2; exit 1; }
 [[ -f "${CKPT}" ]] || { echo "找不到预训练权重：${CKPT}" >&2; exit 1; }
+[[ -n "${FFMPEG}" && -x "${FFMPEG}" ]] || {
+  echo "找不到可执行的 ffmpeg（当前 FFMPEG='${FFMPEG}'）。请 export FFMPEG=<ffmpeg 绝对路径>。" >&2; exit 1; }
+
+# 关键：把 REPO / CKPT 显式传给子脚本。finalize_and_train.sh 里 REPO 的默认值是
+# "/hy-tmp/av_hubert_train"，本仓库不在那个位置时它会直接 cd 失败退出。
+# （子脚本用的是 ${_OVR_X:-${X:-默认}} 的快照写法，这里 export 就能生效。）
+export REPO="${REPO_ROOT}" CKPT
 
 export LRS2_ROOT DATALIST WORK FFMPEG DLIB NSHARD MODALITY
 
 if [[ "${MODE}" == "smoke" ]]; then
-  # 小样本：独立目录，绝不碰全量产物
-  export WORK="${WORK}_smoke"
+  # 小样本：独立目录，绝不碰全量产物（加后缀前先判断，避免重复调用变成 _smoke_smoke）
+  case "${WORK}" in *_smoke) ;; *) export WORK="${WORK}_smoke" ;; esac
+  case "${EXP}" in *_smoke) ;; *) export EXP="${EXP}_smoke" ;; esac
   export LIMIT="${LIMIT:-30}"
   export MAX_UPDATE="${SMOKE_STEPS:-20}"
-  unset NEW_TEST_SET
   log "冒烟模式：WORK=${WORK} LIMIT=${LIMIT} 训练 ${MAX_UPDATE} 步"
   rm -rf "${WORK}"
   bash scripts/pipeline_lrs2.sh all || { echo "数据流水线失败" >&2; exit 1; }
   NO_CACHE="${NO_CACHE:-1}" MAX_UPDATE="${MAX_UPDATE}" BEAM="${BEAM}" \
-    EXP="${EXP}_smoke" WORK="${WORK}" \
+    EXP="${EXP}" WORK="${WORK}" REPO="${REPO_ROOT}" CKPT="${CKPT}" \
     bash scripts/finalize_and_train.sh
   exit $?
 fi
@@ -93,4 +101,5 @@ bash scripts/pipeline_lrs2.sh all || { echo "数据流水线失败" >&2; exit 1;
 
 log "2-4/4 帧缓存 -> 微调 -> 解码"
 MAX_UPDATE="${MAX_UPDATE}" BEAM="${BEAM}" EXP="${EXP}" WORK="${WORK}" \
+  REPO="${REPO_ROOT}" CKPT="${CKPT}" \
   bash scripts/finalize_and_train.sh

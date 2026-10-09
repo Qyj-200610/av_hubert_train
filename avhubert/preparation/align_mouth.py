@@ -126,19 +126,30 @@ def write_video_ffmpeg(rois, target_path, ffmpeg):
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     fps = 25
     rois = np.asarray(rois)
-    if os.path.isfile(target_path):
-        os.remove(target_path)
+
+    # 写在**同目录的临时名**上，成功后用 os.replace 原子改名。
+    #
+    # 为什么必须这样：主循环用"目标已存在就跳过"做续跑（见下面的 resume 逻辑），
+    # 这个前提只有在"目标存在 ⇒ 内容完整"时才安全。原实现直接把 ffmpeg 的输出
+    # 写成最终文件名、只靠 except 删半截文件 —— 而 SIGKILL / OOM killer / 抢占式
+    # 实例回收时 except 根本不会执行，残缺 mp4 会留在原地并被永久信任。
+    # 截断的 h264 仍然能被 cv2 打开，所以 count_frames 的 isOpened 检查也拦不住，
+    # 脏帧数会一路进 manifest。
+    # 关键点阶段 detect_landmark.py 已经是 tmp + os.replace 的写法，这里对齐。
+    # （临时名保留 .mp4 后缀，ffmpeg 需要靠扩展名选容器。）
+    tmp_path = target_path + '.tmp.mp4'
+    if os.path.isfile(tmp_path):
+        os.remove(tmp_path)
 
     try:
-        return _write_video_ffmpeg_inner(rois, target_path, ffmpeg, fps)
+        _write_video_ffmpeg_inner(rois, tmp_path, ffmpeg, fps)
+        if not os.path.isfile(tmp_path):
+            raise RuntimeError("ffmpeg 未产出文件: %s" % tmp_path)
+        os.replace(tmp_path, target_path)   # 原子发布：要么没有，要么完整
     except Exception:
-        # 关键：失败时不能留下半个文件。ffmpeg 不会自己删掉写坏的输出，
-        # 而主循环用"目标已存在就跳过"来做续跑（align_mouth.py 的 resume 逻辑），
-        # 于是这个残缺文件会被当成"已完成"永久保留，后续 count_frames 只看
-        # os.path.isfile 也照样通过，帧数就成了脏数据。
-        if os.path.isfile(target_path):
+        if os.path.isfile(tmp_path):
             try:
-                os.remove(target_path)
+                os.remove(tmp_path)
             except OSError:
                 pass
         raise
@@ -337,6 +348,9 @@ if __name__ == '__main__':
         assert os.path.isfile(landmarks_pathname), "File does not exist. Path input: {}".format(landmarks_pathname)
 
         if os.path.exists(dst_pathname):
+            # 续跑判据：目标存在即视为完成。这一条之所以安全，是因为
+            # write_video_ffmpeg 用 tmp + os.replace 原子发布（见该函数注释）——
+            # 目标文件要么不存在、要么内容完整，不存在"截断文件被信任"的情况。
             continue
 
         try:

@@ -38,7 +38,7 @@ def check_one(args):
     fid, nf_video, video_dir, land_dir = args
     import cv2
     res = {"fid": fid, "err": [], "none_frames": 0, "n_lm": None, "n_vid": None,
-           "shape": None}
+           "shape": None, "all_none": False}
     # landmark
     lp = os.path.join(land_dir, fid + ".pkl")
     try:
@@ -49,6 +49,11 @@ def check_one(args):
         return res
     res["n_lm"] = len(lm)
     res["none_frames"] = sum(1 for x in lm if x is None)
+    # 整段都没检测到人脸：align_mouth.py 会把这种 clip 静默替换成"整帧缩放图"
+    # （`if not preprocessed_landmarks: resizing` 分支），对唇读模型来说是纯噪声输入。
+    # 原来的检查只统计语料级 None 帧数，看不出有多少条 clip 属于这一类，
+    # 所以这里单独标出来。
+    res["all_none"] = (res["n_lm"] > 0 and res["none_frames"] == res["n_lm"])
     # 视频
     vp = os.path.join(video_dir, fid + ".mp4")
     try:
@@ -84,7 +89,18 @@ def main():
 
     W = args.work_dir
     fids = read_lines(os.path.join(W, "file.list"))
-    nf_video = [int(x) for x in read_lines(os.path.join(W, "nframes.video"))]
+    # nframes.video 可能是空文件（流水线没跑到第 5 步），直接 int() 会抛
+    # 一个和病因无关的异常；先给出人话提示。
+    _nf_lines = read_lines(os.path.join(W, "nframes.video"))
+    if not _nf_lines:
+        print("错误：%s 为空或不存在——先把流水线跑到第 5 步（frames）再校验。"
+              % os.path.join(W, "nframes.video"))
+        return 1
+    try:
+        nf_video = [int(x) for x in _nf_lines]
+    except ValueError as e:
+        print("错误：nframes.video 里有非整数值（%r）——文件可能被写坏，建议重跑第 5 步。" % e)
+        return 1
     print("file.list %d 条, nframes.video %d 行" % (len(fids), len(nf_video)))
     if len(fids) != len(nf_video):
         print("错误：file.list 与 nframes.video 长度不一致")
@@ -107,13 +123,22 @@ def main():
         dup = len(ids) - len(set(ids))
         missing_path = 0
         bad_count = 0
+        malformed = 0
         for r in rows:
+            # 列数不对时直接 r[1]/r[3] 会抛 IndexError，把"tsv 格式坏了"报成
+            # 一句看不懂的 traceback；这里先判定再取值。
+            if len(r) != 5:
+                malformed += 1
+                continue
             if not os.path.isfile(r[1]):
                 missing_path += 1
-            if r[0] in nf_map and int(r[3]) != nf_map[r[0]]:
-                bad_count += 1
-        print("  %-8s 行=%-6d root=%-3s 列数全为5=%s 重复id=%d 视频文件缺失=%d 帧数列与nframes不符=%d"
-              % (split, len(rows), repr(root), col_ok, dup, missing_path, bad_count))
+            try:
+                if r[0] in nf_map and int(r[3]) != nf_map[r[0]]:
+                    bad_count += 1
+            except ValueError:
+                malformed += 1
+        print("  %-8s 行=%-6d root=%-3s 列数全为5=%s 重复id=%d 视频文件缺失=%d 帧数列与nframes不符=%d 格式异常=%d"
+              % (split, len(rows), repr(root), col_ok, dup, missing_path, bad_count, malformed))
         seen[split] = set(ids)
     for a, b in (("train", "valid"), ("train", "test"), ("valid", "test")):
         if a in seen and b in seen:
@@ -133,7 +158,7 @@ def main():
     work = [(f, nf_map.get(f), os.path.join(W, "video"), os.path.join(W, "landmark"))
             for f in targets]
 
-    bad, total_none, shapes = [], 0, {}
+    bad, total_none, shapes, all_none_fids = [], 0, {}, []
     try:
         from tqdm import tqdm
     except Exception:
@@ -144,6 +169,8 @@ def main():
             it = tqdm(it, total=len(work))
         for res in it:
             total_none += res["none_frames"]
+            if res.get("all_none"):
+                all_none_fids.append(res["fid"])
             if res["shape"]:
                 shapes[res["shape"]] = shapes.get(res["shape"], 0) + 1
             if res["err"]:
@@ -154,6 +181,12 @@ def main():
     print("  有问题条数: %d" % len(bad))
     print("  尺寸分布: %s" % shapes)
     print("  无脸帧(None) 总数: %d" % total_none)
+    # 整段无脸的 clip：align_mouth 把它们替换成"整帧缩放图"，对唇读是噪声输入。
+    pct = (100.0 * len(all_none_fids) / len(targets)) if targets else 0.0
+    print("  整段无脸的 clip: %d 条（%.2f%%）" % (len(all_none_fids), pct))
+    if all_none_fids:
+        print("    这类样本的 ROI 不是嘴部裁切，而是整帧缩放，建议从训练集剔除或单独评估。")
+        print("    前 5 条：%s" % ", ".join(all_none_fids[:5]))
     if bad:
         print("\n  前 10 条问题样本：")
         for r in bad[:10]:

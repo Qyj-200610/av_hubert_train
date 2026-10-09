@@ -135,14 +135,18 @@ def main():
     # index.npz，中途被杀就会得到"旧索引 + 半截且顺序不同的新 bin"，
     # 而 FrameCache 只会按 offset 切片——**每个 offset 都是 h*w 的整数倍，
     # 于是总能 reshape 成功，静默读到别的 clip 的帧**。
-    # 所以：先删掉旧索引，新索引用 tmp + os.replace 原子发布。
-    if os.path.exists(bin_path):
-        os.remove(bin_path)
-    if os.path.exists(index_path):
-        os.remove(index_path)
-    tmp_index_path = index_path + ".tmp"
-    if os.path.exists(tmp_index_path):
-        os.remove(tmp_index_path)
+    #
+    # 做法：**先写到 .new 临时名**，全部成功后再依次 os.replace 发布。
+    # 这样"构建失败"不会破坏上一份可用缓存（原实现是开跑前先 rm 掉旧的两个文件，
+    # 于是任何一次失败——包括磁盘满、被 kill——都会连累已经建好的 24 GB 缓存）。
+    # 发布顺序是"先 bin 后 index"：万一在这两步之间被杀，读者会看到
+    # "新 bin + 旧 index"，而 FrameCache 会用索引里的 bin_size 校验并拒绝这一对，
+    # 不会静默读到错帧。
+    tmp_bin_path = bin_path + ".new"
+    tmp_index_path = index_path + ".partial"
+    for p in (tmp_bin_path, tmp_index_path):
+        if os.path.exists(p):
+            os.remove(p)
 
     try:
         from tqdm import tqdm
@@ -150,7 +154,7 @@ def main():
     except Exception:
         prog = None
 
-    with open(bin_path, "wb") as fo, Pool(args.workers) as pool:
+    with open(tmp_bin_path, "wb") as fo, Pool(args.workers) as pool:
         for key, frames in pool.imap_unordered(_load_one, pairs, chunksize=8):
             if frames is None or frames.ndim != 3:
                 failed.append(key)
@@ -172,12 +176,23 @@ def main():
     if failed:
         print("警告：%d 条解码失败（前 3 个：%s）" % (len(failed), failed[:3]))
     if not keys:
-        print("没有任何样本成功，退出")
+        print("没有任何样本成功，退出（旧的缓存保持不变）")
+        if os.path.exists(tmp_bin_path):
+            os.remove(tmp_bin_path)
         return 1
 
     heights, widths = set(heights), set(widths)
-    assert len(heights) == 1 and len(widths) == 1, \
-        "帧尺寸不一致：%s / %s" % (heights, widths)
+    if len(heights) != 1 or len(widths) != 1:
+        # 原来是 assert：python -O 下会被整个去掉，这里改成显式报错
+        print("错误：帧尺寸不一致：%s / %s（旧的缓存保持不变）" % (heights, widths))
+        if os.path.exists(tmp_bin_path):
+            os.remove(tmp_bin_path)
+        return 1
+    if os.path.getsize(tmp_bin_path) != offset:
+        print("错误：bin 写入字节数不符（%d != %d），放弃发布"
+              % (os.path.getsize(tmp_bin_path), offset))
+        os.remove(tmp_bin_path)
+        return 1
 
     # ---- 原子发布索引 ----
     # 坑（实测踩过，而且正是它让"原子发布"这版修复失效）：
@@ -188,7 +203,7 @@ def main():
     #   见 results/04_原始产物/训练与评测_全流程日志.log 里的
     #   "警告：帧缓存构建失败，改为在线解码继续训练"）。
     #   修法：传**文件对象**给 np.savez —— 这时 numpy 不会动文件名。
-    tmp_index_path = index_path + ".partial"
+    #   （tmp_index_path 已在上面统一定义为 index_path + ".partial"）
     with open(tmp_index_path, "wb") as fh:
         np.savez(
             fh,
@@ -202,7 +217,8 @@ def main():
             bin_size=np.int64(offset),
             n_frames=np.int64(sum(lengths)),
         )
-    os.replace(tmp_index_path, index_path)   # 原子发布
+    os.replace(tmp_bin_path, bin_path)       # 原子发布 bin
+    os.replace(tmp_index_path, index_path)   # 再原子发布索引（读者用 bin_size 校验配对）
 
     if not os.path.isfile(index_path):
         print("错误：索引发布失败，%s 不存在" % index_path)
