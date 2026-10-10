@@ -36,16 +36,29 @@ _OVR_WORK="${WORK:-}"; _OVR_EXP="${EXP:-}"; _OVR_MODALITY="${MODALITY:-}"
 _OVR_MAX_UPDATE="${MAX_UPDATE:-}"; _OVR_BEAM="${BEAM:-}"; _OVR_NSHARD="${NSHARD:-}"
 _OVR_LRS2_ROOT="${LRS2_ROOT:-}"; _OVR_DATALIST="${DATALIST:-}"; _OVR_DLIB="${DLIB:-}"
 
-if [[ -f /hy-tmp/avh_env.sh ]]; then
+# 环境文件路径：与 finalize_and_train.sh 一致，支持 AVH_ENV 覆盖、文件不存在就跳过。
+# （原来这里写死 /hy-tmp/avh_env.sh 且**完全不认 AVH_ENV**，而 avh_env.example.sh
+#   和 docs/复现结果.md 都写了"可用 AVH_ENV 指定"——照文档做会失败。）
+AVH_ENV="${AVH_ENV:-/hy-tmp/avh_env.sh}"
+if [[ -f "${AVH_ENV}" ]]; then
   # 同 finalize_and_train.sh：avh_env.sh 里用了 ${PYTHONPATH}（未定义时会因 set -u 报错），
   # source 期间临时关掉 -u
   set +u
-  # shellcheck disable=SC1091
-  source /hy-tmp/avh_env.sh
+  # shellcheck disable=SC1090
+  source "${AVH_ENV}"
   set -u
+else
+  echo "[提示] 未找到环境文件 ${AVH_ENV}，按命令行/默认值继续（模板见 scripts/avh_env.example.sh）"
 fi
 
+# 模式校验：以前 `MODE="${1:-full}"` 只判断"是不是 smoke"，其余一律走全量——
+# 把 `smoke` 打成 `smoke1`、或照 run_finetune.sh 的习惯写成 `test`，
+# 都会**静默启动数小时的预处理 + 8000 步训练**，而不是报错。
 MODE="${1:-full}"
+case "${MODE}" in
+  smoke|full) ;;
+  *) echo "用法: bash scripts/run_reproduce.sh [smoke|full]（当前：'${MODE}'）" >&2; exit 1 ;;
+esac
 WORK="${_OVR_WORK:-${WORK:-/hy-tmp/lrs2_data}}"
 EXP="${_OVR_EXP:-${EXP:-/hy-tmp/exp}}"
 MODALITY="${_OVR_MODALITY:-${MODALITY:-video}}"

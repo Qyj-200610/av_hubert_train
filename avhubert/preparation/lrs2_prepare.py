@@ -329,17 +329,43 @@ def main():
             sys.exit(1)
 
     # ---------- 落盘 ----------
+    # 三个列表都用「临时文件 + os.replace」原子发布。
+    # 原因：file.list 是**整个流水线的规模基准**——`pipeline_lrs2.sh` 用
+    # `need=$(wc -l < file.list)` 判断"产物齐了没有"，分片切分也按它的长度算。
+    # 如果这一步被杀/磁盘满，留下一个**短了**的 file.list，那么"齐备检查"会
+    # 按更小的数字通过，后续步骤只处理这一部分，最后训练集静默变小——
+    # 而 verify_dataset.py 校验的是"三者自洽"，也发现不了。
     file_list = os.path.join(args.work_dir, "file.list")
     label_list = os.path.join(args.work_dir, "label.list")
     # 额外产出 split.list：flat 布局下 fid 不带划分前缀，
     # lrs2_manifest.py 需要靠它来划分 train/valid/test。
     split_list = os.path.join(args.work_dir, "split.list")
-    with open(file_list, "w", encoding="utf-8") as fo:
-        fo.write("\n".join(fids_all) + "\n")
-    with open(label_list, "w", encoding="utf-8") as fo:
-        fo.write("\n".join(labels_all) + "\n")
-    with open(split_list, "w", encoding="utf-8") as fo:
-        fo.write("\n".join(splits_all) + "\n")
+
+    def _atomic_write(path, text):
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
+                fo.write(text)
+                fo.flush()
+                os.fsync(fo.fileno())
+            os.replace(tmp, path)      # 要么没有，要么完整
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
+
+    _atomic_write(file_list, "\n".join(fids_all) + "\n")
+    _atomic_write(label_list, "\n".join(labels_all) + "\n")
+    _atomic_write(split_list, "\n".join(splits_all) + "\n")
+
+    # 写盘后立刻自检三个列表必须等长（等长是下游所有对齐检查的前提）
+    _n = [len(fids_all), len(labels_all), len(splits_all)]
+    if len(set(_n)) != 1:
+        print("错误：file.list / label.list / split.list 长度不一致：%s" % _n)
+        sys.exit(1)
 
     summary = OrderedDict(
         lrs2_root=os.path.abspath(args.lrs2_root),
@@ -350,8 +376,8 @@ def main():
         total=len(fids_all),
         per_split=stats,
     )
-    with open(os.path.join(args.work_dir, "lrs2.prepare.summary.json"), "w", encoding="utf-8") as fo:
-        json.dump(summary, fo, ensure_ascii=False, indent=2)
+    _atomic_write(os.path.join(args.work_dir, "lrs2.prepare.summary.json"),
+                  json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
 
     print()
     print("完成：共 %d 条" % len(fids_all))

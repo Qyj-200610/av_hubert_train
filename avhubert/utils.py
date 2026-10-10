@@ -128,8 +128,27 @@ class FrameCache(object):
             self._misses += 1
             return None
         off, length, h, w = item
+        n = length * h * w
+        # 越界显式报错：NumPy 对超长切片是**静默截断**的，切短了 reshape 仍可能成功，
+        # 于是静默读到"前几个 clip"当成本样本——形状合法、内容全错。
+        if off < 0 or off + n > self._mm.size:
+            raise ValueError(
+                "FrameCache 索引越界：%s 需要 [%d, %d)，但 frames.bin 只有 %d 字节"
+                % (path, off, off + n, self._mm.size))
         self._hits += 1
-        return self._mm[off: off + length * h * w].reshape(length, h, w)
+        # ★ 必须返回**可写副本**，不能直接返回 memmap 视图。
+        #   self._mm 是 mode="r" 的 np.memmap，它的切片是 writeable=False 的视图；
+        #   而训练时 image_aug=True 的变换链最后一步是
+        #       frames[index] = cv2.flip(frames[index], 1)   # utils.HorizontalFlip
+        #   对这个只读视图原地赋值会直接抛
+        #       ValueError: assignment destination is read-only
+        #   也就是说：一旦帧缓存真的生效（构建成功、且是 train split），
+        #   第一个样本就会崩。在线解码路径一直没事，是因为 load_video 里的
+        #   np.stack 返回的是新的可写数组——只有缓存路径有这个回归。
+        #   顺带：副本也解除了对 frames.bin 页缓存的别名，增广永远写不回缓存文件。
+        #   代价可忽略：一次 ~0.6 MB 的 memcpy（微秒级），而省掉的是一次
+        #   ~17 ms 的 mp4 解码——这正是缓存存在的意义。
+        return np.array(self._mm[off: off + n], dtype=np.uint8).reshape(length, h, w)
 
 
 class Compose(object):

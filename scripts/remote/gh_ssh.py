@@ -103,6 +103,10 @@ def run(cli, cmd, timeout=3600, tail=None, label=None):
         print('>> ' + label)
         print('=' * 72)
     _, so, se = cli.exec_command(cmd, timeout=timeout)
+    # 顺序读 stdout / stderr 在这里是安全的（不需要额外线程）：
+    # paramiko 的通道有自己的接收缓冲（stderr 走同一个 channel 的扩展数据，
+    # 由 transport 线程持续收进无界 BufferedPipe），所以不会出现 subprocess 那种
+    # "stderr 写满 OS 管道 → 远端阻塞 → 本地卡在 stdout.read()" 的死锁。
     out = so.read().decode('utf-8', 'replace')
     err = se.read().decode('utf-8', 'replace')
     rc = so.channel.recv_exit_status()

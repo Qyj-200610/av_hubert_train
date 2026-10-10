@@ -154,21 +154,36 @@ def main():
     except Exception:
         prog = None
 
-    with open(tmp_bin_path, "wb") as fo, Pool(args.workers) as pool:
-        for key, frames in pool.imap_unordered(_load_one, pairs, chunksize=8):
-            if frames is None or frames.ndim != 3:
-                failed.append(key)
-                continue
-            t, h, w = frames.shape
-            fo.write(frames.tobytes())
-            keys.append(key)
-            offsets.append(offset)
-            lengths.append(t)
-            heights.append(h)
-            widths.append(w)
-            offset += t * h * w
-            if prog is not None:
-                prog.update(1)
+    # 解码 + 写临时 bin。整段包在 try/except 里：磁盘满（OSError）、Ctrl-C、
+    # 或任何未预料的异常都会带着 ~24 GB 的半截 frames.bin.new 退出，把磁盘占住，
+    # 下一次重试前都放不下——原来只有下面三个显式 return 1 的分支会清理。
+    try:
+        with open(tmp_bin_path, "wb") as fo, Pool(args.workers) as pool:
+            for key, frames in pool.imap_unordered(_load_one, pairs, chunksize=8):
+                if frames is None or frames.ndim != 3:
+                    failed.append(key)
+                    continue
+                t, h, w = frames.shape
+                fo.write(frames.tobytes())
+                keys.append(key)
+                offsets.append(offset)
+                lengths.append(t)
+                heights.append(h)
+                widths.append(w)
+                offset += t * h * w
+                if prog is not None:
+                    prog.update(1)
+    except BaseException:
+        if prog is not None:
+            prog.close()
+        for _p in (tmp_bin_path, tmp_index_path):
+            if os.path.exists(_p):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+        print("构建中断，已清理临时文件（旧的缓存保持不变）：%s" % tmp_bin_path)
+        raise
     if prog is not None:
         prog.close()
 

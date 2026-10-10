@@ -160,9 +160,14 @@ optimizer:
 
 lr_scheduler:
   _name: tri_stage
-  warmup_steps: 2000               # 保持官方 warmup:decay = 1:2 的比例
+  # ⚠️ tri_stage 用的是**固定步数**（不是比例）。下面两个值是按 max_update=8000 定的
+  #    （warmup 占 1/4、decay 占 3/4）。如果只改 optimization.max_update 而不动这里，
+  #    decay 会在第 8000 步结束，之后的步数全跑在 lr*final_lr_scale 上（静默欠训练）。
+  #    `scripts/run_finetune.sh fast` 会在 MAX_UPDATE 被覆盖时自动按同样比例改这两个值；
+  #    用其它方式启动时请手动一起改（或用 lr_scheduler.phase_ratio 改写成比例式）。
+  warmup_steps: 2000               # = max_update / 4
   hold_steps: 0
-  decay_steps: 6000                # warmup 2000 + decay 6000 = max_update 8000
+  decay_steps: 6000                # = max_update - warmup_steps（warmup 2000 + decay 6000 = 8000）
   final_lr_scale: 0.05
 
 model:

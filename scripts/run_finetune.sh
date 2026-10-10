@@ -175,9 +175,33 @@ case "${MODE}" in
     [[ -n "${FREEZE_UPDATES:-}" ]] && overrides+=("model.freeze_finetune_updates=${FREEZE_UPDATES}")
     [[ -n "${WORKERS:-}"        ]] && overrides+=("dataset.num_workers=${WORKERS}")
     [[ -n "${STOP_HOURS:-}"     ]] && overrides+=("optimization.stop_time_hours=${STOP_HOURS}")
+
+    # ★ 步数与 LR 调度必须一起改，否则会静默欠训练。
+    #   fast 配置里 `warmup_steps: 2000` / `decay_steps: 6000` 是按 max_update=8000
+    #   写死的，而 tri_stage 用的是**固定步数**（不是 phase_ratio 比例）。
+    #   只覆盖 max_update 的后果：例如按 results/02 建议的 MAX_UPDATE=30000，
+    #   decay 在第 8000 步就走完了，剩下的 22000 步（73% 的训练时间）全跑在
+    #   lr*final_lr_scale = 0.0001 上——日志里看起来"训了 30000 步"，实际上是白跑。
+    #   这里沿用 fast 配置原有的 warmup:decay = 1:3（warmup 占 1/4）自动跟随；
+    #   想自己定就设 WARMUP_STEPS / DECAY_STEPS，或在 EXTRA 里显式给出 lr_scheduler.*。
+    if [[ -n "${MAX_UPDATE:-}" ]] && [[ "${EXTRA:-}" != *warmup_steps* ]]; then
+      _wu="${WARMUP_STEPS:-$(( MAX_UPDATE / 4 ))}"
+      # 先把实际采用的 decay 算出来再打印，避免"日志里印的和真正追加的覆盖项不一致"
+      # （显式给了 DECAY_STEPS 时原来就会不一致——本项目把日志当证据用，不能这样）
+      _dec="${DECAY_STEPS:-$(( MAX_UPDATE - _wu ))}"
+      overrides+=("lr_scheduler.warmup_steps=${_wu}")
+      overrides+=("lr_scheduler.decay_steps=${_dec}")
+      echo "LR 调度随 MAX_UPDATE=${MAX_UPDATE} 调整为 warmup=${_wu} / decay=${_dec}"
+    fi
     if [[ -n "${EXTRA:-}" ]]; then
+      # EXTRA 的约定是"空格分隔的 hydra 覆盖项"，所以需要词分割——但**不需要**
+      # 路径名展开：脚本前面已经 `cd "${REPO_ROOT}"`，一旦某个值里带 `*`/`?`
+      # 又恰好匹配到仓库根目录下的文件，就会被替换成文件名，hydra 拿到一堆垃圾参数。
+      # 临时关掉 glob（set -f）是最省事且不改语义的写法。
+      set -f
       # shellcheck disable=SC2206
       overrides+=(${EXTRA})
+      set +f
     fi
 
     if [[ ${#overrides[@]} -gt 0 ]]; then

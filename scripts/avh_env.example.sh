@@ -48,9 +48,14 @@ export DLIB="${DLIB:-/hy-tmp/dlib}"
 # export CKPT="${CKPT:-/hy-tmp/av_hubert_train/pretrained/base_vox_iter4.pt}"
 
 # Python 能 import 到 avhubert / fairseq
-# 注意：未定义 PYTHONPATH 时这里要用 :- 兜一下，否则 set -u 的脚本 source 会报
-# "PYTHONPATH: unbound variable" 直接中断（这个坑本项目踩过）
-export PYTHONPATH="${PYTHONPATH:-}:${REPO:-/hy-tmp/av_hubert_train}"
+# 注意两点：
+#   1) 未定义 PYTHONPATH 时要用 :- 兜一下，否则 set -u 的脚本 source 会报
+#      "PYTHONPATH: unbound variable" 直接中断（这个坑本项目踩过）。
+#   2) **不要**写成 "${PYTHONPATH:-}:..."——那会在最前面留下一个**空组件**，
+#      而 Python 把空组件当成"当前目录"，等于把 CWD 悄悄加进 sys.path，
+#      可能让工作目录里的同名文件抢先导入。
+#      正确写法：自己的路径在前，原有值用 ${PYTHONPATH:+:...} 追加（为空时不加冒号）。
+export PYTHONPATH="${REPO:-/hy-tmp/av_hubert_train}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ---------- 流水线 / 训练行为（一般不用改）----------
 # 并行分片数：**看 cgroup 配额，别信 $(nproc)**

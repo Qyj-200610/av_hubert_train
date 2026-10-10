@@ -130,15 +130,13 @@ def upload_part(idx, nparts, local, dest, total, stagger):
                 done_bytes[0] += want
                 remote_part_sizes[idx] = want
             print('   part%02d 已完整（%s），跳过' % (idx, human(want)))
-            sftp.close()
-            cli.close()
-            return
+            return      # 连接由下面的 finally 统一关闭
         if already > want:
             # 远端比预期还大，说明上次写坏了，从头重来
             print('   part%02d 远端过大（%s > %s），重传' % (idx, human(already), human(want)))
             already = 0
 
-        if already:
+        if already and want:
             print('   part%02d 从 %.1f%% 处续传' % (idx, 100.0 * already / want))
 
         CHUNK = 4 * 1024 * 1024
@@ -164,11 +162,20 @@ def upload_part(idx, nparts, local, dest, total, stagger):
         if st.st_size != want:
             with lock:
                 errors.append('part%02d 大小不符：远端 %d != 期望 %d' % (idx, st.st_size, want))
-        sftp.close()
-        cli.close()
     except Exception as e:
         with lock:
             errors.append('part%02d: %s: %s' % (idx, type(e).__name__, str(e)[:80]))
+    finally:
+        # ★ 失败路径原来不关连接（只有成功路径关了），每失败一个分片就泄漏一个
+        #   SSH transport + SFTP 会话，直到线程结束；分片多时会把连接数堆满。
+        try:
+            sftp.close()
+        except Exception:
+            pass
+        try:
+            cli.close()
+        except Exception:
+            pass
 
 
 def main():
@@ -191,6 +198,11 @@ def main():
         print()
 
         t_start[0] = time.time()
+        # total 为 0（空文件）时下面的 pct 会 ZeroDivisionError：分片线程会立刻
+        # 返回，但线程 1/2 还在 sleep(stagger*idx)，所以这个循环体真的会被执行到。
+        if total <= 0:
+            print('⚠ 本地文件大小为 0，没有东西可传；请检查 --archive 指向的文件。')
+            sys.exit(1)
         threads = [threading.Thread(target=upload_part,
                                     args=(i, args.conns, args.archive, args.dest, total, args.stagger))
                    for i in range(args.conns)]
@@ -221,21 +233,50 @@ def main():
 
     print('\n远端合并分片并校验...')
     cli = connect()
-    cmd = ('cd {d} && cat {b}.part* > {b} && rm -f {b}.part* && stat -c %s {b} && ls -lh {b}'
-           ).format(d=args.dest, b=base)
+    # ★ 原来的命令是 `cat {b}.part* > {b}`，有两个真问题：
+    #   1) 分片一个都不匹配时（例如上一次已经合并过、part 文件已被删，而你再跑
+    #      `--merge-only`），bash 会把通配符原样保留，而重定向 `> {b}` 在 cat
+    #      执行**之前**就把目标文件截成 0 字节 —— 远端那份已经传好的大文件被抹掉。
+    #   2) 没有取远端退出码，"校验失败"也只是打印一句 ⚠ 然后 exit 0。
+    #   改法：先判断有没有分片；合并到 .tmp 再 mv（成功才覆盖目标）；显式 echo 状态码。
+    cmd = (
+        'cd {d} || exit 3; set -- {b}.part*; '
+        'if [ ! -e "$1" ]; then echo "NO_PARTS"; exit 4; fi; '
+        'n=$(ls {b}.part* 2>/dev/null | wc -l); '
+        'cat {b}.part* > {b}.tmp || {{ rm -f {b}.tmp; echo "CAT_FAILED"; exit 5; }}; '
+        'mv -f {b}.tmp {b} || exit 6; '
+        'rm -f {b}.part*; '
+        'echo "PARTS=$n"; stat -c %s {b}; ls -lh {b}'
+    ).format(d=args.dest, b=base)
     _, so, se = cli.exec_command(cmd, timeout=1800)
+    # 同样要并发读（见 gh_ssh.run 的说明）；这里为了不引入依赖，先读 stdout 再读
+    # stderr 也可以——paramiko 会把 stderr 缓存在无界缓冲里，不会死锁。
     out = so.read().decode('utf-8', 'replace').strip()
+    rc = so.channel.recv_exit_status()
     err = se.read().decode('utf-8', 'replace').strip()
     print(out if out else '(无输出)')
     if err:
         print('stderr: ' + err)
     cli.close()
 
-    first = out.split('\n')[0].strip() if out else ''
-    if total and first.isdigit() and int(first) == total:
+    if rc != 0:
+        print('\n✗ 远端合并失败（退出码 %s）。目标文件未被破坏。' % rc)
+        sys.exit(1)
+
+    nums = [l.strip() for l in out.split('\n') if l.strip().isdigit()]
+    first = nums[0] if nums else ''
+    if not first:
+        print('\n⚠ 没解析到远端文件大小，无法校验。')
+        sys.exit(1)
+    if total is None:
+        # --merge-only 时不掌握本地大小，只能报现状（原来这种情况是完全不校验的）
+        print('\n（--merge-only：未提供本地大小，只报远端大小 %s；'
+              '要严格校验请带 --archive 一起跑）' % human(int(first)))
+    elif int(first) == total:
         print('\n✓ 校验通过：远端 %s，与本地完全一致' % human(int(first)))
-    elif total:
+    else:
         print('\n⚠ 大小不一致！本地 %d，远端 %s' % (total, first))
+        sys.exit(1)
 
 
 if __name__ == '__main__':

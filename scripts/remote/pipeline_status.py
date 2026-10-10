@@ -25,7 +25,10 @@ pipeline_status.py -- 查看实例上全量预处理流水线的进度（单次�
 """
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # gh_ssh/train_optimize 就在同目录
+# 注意：本文件的 os 是在上面以 `import os as _os` 绑定的（废弃守卫要在任何
+# 其它 import 之前跑），所以这里只能用 _os —— 之前写成 os.path 会在启动时
+# 直接 NameError: name 'os' is not defined。
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))  # gh_ssh 就在同目录
 from gh_ssh import connect, run  # noqa: E402
 
 TOTAL = 48164
@@ -37,7 +40,10 @@ def main():
     print('LRS2 预处理流水线进度')
     print('=' * 66)
 
-    rc, out = run(cli, 'pgrep -c -f "pipeline_lrs2.sh" 2>/dev/null || echo 0', timeout=60)
+    # ⚠ 用 [p] 写法：`pgrep -f "pipeline_lrs2.sh"` 会匹配到**执行这条命令的外层 shell**
+    #   自身（它的命令行里就含这个字符串），于是永远报"运行中"，永远看不出流水线已结束。
+    #   仓库其它地方（run_parallel_pipeline.py:162）本来就在用这个技巧。
+    rc, out = run(cli, 'pgrep -c -f "[p]ipeline_lrs2" 2>/dev/null || echo 0', timeout=60)
     alive = out.strip().splitlines()[-1].strip() if out.strip() else '0'
     print('流水线进程: %s' % ('运行中' if alive not in ('0', '') else '已结束'))
 

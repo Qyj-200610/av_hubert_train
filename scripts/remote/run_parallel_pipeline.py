@@ -49,10 +49,18 @@ def cmd_env(cli):
 
 
 def cmd_stop(cli):
-    sh(cli, 'pkill -f "pipeline_lrs2.sh" 2>/dev/null; sleep 1; '
-            'pkill -f "detect_landmark.py" 2>/dev/null; '
-            'pkill -f "align_mouth.py" 2>/dev/null; sleep 2; '
-            'echo "--- 残留进程 ---"; pgrep -af "pipeline_lrs2|detect_landmark|align_mouth" || echo "无"; '
+    # ★ 必须用 [p] / [d] / [a] 这种方括号写法。
+    #   整条命令是通过 `bash -c '<字符串>'` 执行的，**外层 shell 自己的命令行里
+    #   就含有 "pipeline_lrs2.sh" 这些字面量**；`pkill -f` / `pgrep -f` 匹配的是
+    #   完整命令行、而且只排除 pgrep 自己，于是：
+    #     - `pkill -f "pipeline_lrs2.sh"` 会把执行它的那个 bash 一起杀掉 →
+    #       后面几条 pkill 和收尾的 echo 都不会执行，输出看起来还像"成功"；
+    #     - `pgrep -af "..."` 会把外层 shell 当成"残留流水线进程"报出来。
+    #   方括号让模式本身不再匹配自己（本项目其它地方 162 行也用了这个技巧）。
+    sh(cli, 'pkill -f "[p]ipeline_lrs2.sh" 2>/dev/null; sleep 1; '
+            'pkill -f "[d]etect_landmark.py" 2>/dev/null; '
+            'pkill -f "[a]lign_mouth.py" 2>/dev/null; sleep 2; '
+            'echo "--- 残留进程 ---"; pgrep -af "[p]ipeline_lrs2|[d]etect_landmark|[a]lign_mouth" || echo "无"; '
             'echo "--- load ---"; uptime',
        timeout=300, label='停止串行流水线')
 
@@ -108,7 +116,7 @@ def cmd_full(cli):
         'cd %s && setsid bash scripts/pipeline_lrs2.sh all '
         '</dev/null >/hy-tmp/pipeline_parallel.log 2>&1 & '
         'sleep 8; echo "--- 已启动，当前进程 ---"; '
-        'pgrep -af "pipeline_lrs2.sh" | head; '
+        'pgrep -af "[p]ipeline_lrs2" | head; '
         'echo "--- 日志开头 ---"; head -20 /hy-tmp/pipeline_parallel.log'
     ) % (WORK, REPO_REMOTE)
     sh(cli, cmd, timeout=300, tail=30, label='步骤3：全量并行运行（后台）')
@@ -116,7 +124,7 @@ def cmd_full(cli):
 
 def cmd_monitor(cli):
     sh(cli, 'L=/hy-tmp/pipeline_parallel.log; '
-            'echo "--- 进程 ---"; pgrep -c -f pipeline_lrs2.sh || echo 0; '
+            'echo "--- 进程 ---"; pgrep -c -f "[p]ipeline_lrs2" || echo 0; '
             'echo "--- 阶段日志 ---"; grep -a "====" $L | tail -6; '
             'echo "--- 进度(TQDM 最后一行) ---"; tail -c 2000 $L | tr "\\r" "\\n" | grep -aE "it/s|it\\]" | tail -3; '
             'echo "--- 错误 ---"; grep -aiE "错误|error|Traceback" $L | tail -5 || echo "无"; '
@@ -174,9 +182,17 @@ def main():
         return 2
     cli = connect(verbose=False)
     try:
-        fn(cli)
+        # ★ 必须把子命令的返回值透传出去：原来写成 `fn(cli)` 然后无条件 `return 0`，
+        #   于是 `validate` 里精心写的 `exit $rc` / 小样本校验失败，在本地看仍然是
+        #   退出码 0 —— `... validate && collect_results.py` 这类串联会把失败当成功。
+        rc = fn(cli)
     finally:
         cli.close()
+    if isinstance(rc, int):
+        return rc
+    # 有些子命令返回的是 (rc, out) 之类的元组，取第一个元素
+    if isinstance(rc, tuple) and rc and isinstance(rc[0], int):
+        return rc[0]
     return 0
 
 

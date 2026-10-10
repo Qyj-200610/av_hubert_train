@@ -56,20 +56,25 @@ def check_one(args):
     res["all_none"] = (res["n_lm"] > 0 and res["none_frames"] == res["n_lm"])
     # 视频
     vp = os.path.join(video_dir, fid + ".mp4")
+    # cap 在 try 之外先声明 + finally 里释放：原实现只在"正常读完"和
+    # "打不开"两条路径上 release，一旦中间抛异常（解码器出错等）句柄就泄漏；
+    # 4.8 万条 × 多 worker 下有耗尽句柄的现实风险。
+    cap = None
     try:
         cap = cv2.VideoCapture(vp)
         if not cap.isOpened():
             res["err"].append("ROI 视频打不开")
-            cap.release()
             return res
         res["n_vid"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         res["shape"] = (w, h)
-        cap.release()
     except Exception as e:
         res["err"].append("ROI 视频读取异常: %r" % e)
         return res
+    finally:
+        if cap is not None:
+            cap.release()
     # 三方一致
     if nf_video is not None and res["n_lm"] != nf_video:
         res["err"].append("landmark 条数 %d != tsv 记录 %d" % (res["n_lm"], nf_video))
@@ -88,12 +93,20 @@ def main():
     args = ap.parse_args()
 
     W = args.work_dir
+    # 先检查文件**是否存在**再读：read_lines 里的 open() 没保护，缺文件会直接抛
+    # FileNotFoundError，把"该跑第 5 步了"这句人话提示完全盖掉。
+    for _f, _hint in (("file.list", "先跑流水线第 1 步（prepare）"),
+                      ("nframes.video", "先跑流水线第 5 步（frames）")):
+        _p = os.path.join(W, _f)
+        if not os.path.isfile(_p):
+            print("错误：找不到 %s —— %s。" % (_p, _hint))
+            return 1
     fids = read_lines(os.path.join(W, "file.list"))
     # nframes.video 可能是空文件（流水线没跑到第 5 步），直接 int() 会抛
     # 一个和病因无关的异常；先给出人话提示。
     _nf_lines = read_lines(os.path.join(W, "nframes.video"))
     if not _nf_lines:
-        print("错误：%s 为空或不存在——先把流水线跑到第 5 步（frames）再校验。"
+        print("错误：%s 是空文件——流水线第 5 步可能没跑完，请重跑（frames）。"
               % os.path.join(W, "nframes.video"))
         return 1
     try:
@@ -110,10 +123,12 @@ def main():
     # ---- split / tsv 检查 ----
     print("\n=== tsv 检查 ===")
     seen = {}
+    tsv_problems = []          # 结构性错误：格式坏了 / 有重复 id / 视频文件缺失 / 帧数列不符
     for split in ("train", "valid", "test", "test_mv"):
         p = os.path.join(W, "data", "%s.tsv" % split)
         if not os.path.isfile(p):
             print("  %-8s 不存在" % split)
+            tsv_problems.append("%s.tsv 不存在" % split)
             continue
         with open(p, encoding="utf-8") as fh:
             root = fh.readline().rstrip("\n")
@@ -139,14 +154,30 @@ def main():
                 malformed += 1
         print("  %-8s 行=%-6d root=%-3s 列数全为5=%s 重复id=%d 视频文件缺失=%d 帧数列与nframes不符=%d 格式异常=%d"
               % (split, len(rows), repr(root), col_ok, dup, missing_path, bad_count, malformed))
+        # ★ 这些原来只是"打印出来"，不影响退出码 —— 于是整份 tsv 列数都不对
+        #   （比如被写坏成 4 列）时脚本仍然 exit 0，调用方以为校验通过。
+        #   现在汇总进 tsv_problems，最后一起决定退出码。
+        if root != "/":
+            tsv_problems.append("%s.tsv 首行不是 root 行（是 %r）" % (split, root))
+        if not col_ok:
+            tsv_problems.append("%s.tsv 有 %d 行列数不为 5" % (split, malformed))
+        if dup:
+            tsv_problems.append("%s.tsv 有 %d 条重复 id" % (split, dup))
+        if missing_path:
+            tsv_problems.append("%s.tsv 有 %d 条视频文件缺失" % (split, missing_path))
+        if bad_count:
+            tsv_problems.append("%s.tsv 有 %d 条帧数列与 nframes 不符" % (split, bad_count))
         seen[split] = set(ids)
     for a, b in (("train", "valid"), ("train", "test"), ("valid", "test")):
         if a in seen and b in seen:
             inter = seen[a] & seen[b]
             print("  %s ∩ %s = %d %s" % (a, b, len(inter), "OK" if not inter else "★ 泄漏！"))
+            if inter:
+                tsv_problems.append("%s 与 %s 有 %d 条重叠（数据泄漏）" % (a, b, len(inter)))
     if "test" in seen and "test_mv" in seen:
         # 注意别用 ⊆ 之类的非 GBK 字符：Windows 控制台默认 GBK，print 会抛
         # UnicodeEncodeError（本脚本自己踩过）
+        _sub = seen["test_mv"] <= seen["test"]
         print("  test_mv 是否为 test 的子集 ? %s（%d / %d）"
               % (seen["test_mv"] <= seen["test"], len(seen["test_mv"]), len(seen["test"])))
 
@@ -191,6 +222,13 @@ def main():
         print("\n  前 10 条问题样本：")
         for r in bad[:10]:
             print("    %s: %s" % (r["fid"], "; ".join(r["err"])))
+    if tsv_problems:
+        print("\n  tsv 结构问题：")
+        for t in tsv_problems[:20]:
+            print("    - %s" % t)
+    if bad or tsv_problems:
+        print("\n校验未通过（有问题样本 %d 条，tsv 结构问题 %d 项）。"
+              % (len(bad), len(tsv_problems)))
         return 1
     print("\n所有检查通过：tsv 帧数 / landmark 条数 / ROI 实际帧数 三者一致，尺寸均为 96x96。")
     return 0

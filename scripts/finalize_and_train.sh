@@ -68,21 +68,22 @@ REPO="${_OVR_REPO:-${REPO:-${REPO_DEFAULT}}}"
 WORK="${_OVR_WORK:-${WORK:-/hy-tmp/lrs2_data}}"
 EXP="${_OVR_EXP:-${EXP:-/hy-tmp/exp}}"
 CKPT="${_OVR_CKPT:-${CKPT:-${REPO}/pretrained/base_vox_iter4.pt}}"
-MAX_UPDATE="${_OVR_MAX_UPDATE:-8000}"
-STOP_HOURS="${_OVR_STOP_HOURS:-4}"
-NO_CACHE="${_OVR_NO_CACHE:-0}"
-GEN="${_OVR_GEN:-test test_mv}"
-BEAM="${_OVR_BEAM:-10}"
+# ★ 这几个行为开关也必须走 `${_OVR_X:-${X:-默认}}` 三段式。
+#   原来只写了两段 `${_OVR_X:-默认}`，而 _OVR_* 快照的是**调用方自己的环境**，
+#   因此"只写在环境文件里的值"会被静默丢掉——例如把 NO_CACHE=1 / STOP_HOURS=2.5
+#   写进 avh_env.sh（模板 avh_env.example.sh 就是让人这么用的），实际仍会去建
+#   24 GB 帧缓存、墙钟上限仍是 4 小时。路径类变量当初用了三段式所以没这个问题。
+MAX_UPDATE="${_OVR_MAX_UPDATE:-${MAX_UPDATE:-8000}}"
+STOP_HOURS="${_OVR_STOP_HOURS:-${STOP_HOURS:-4}}"
+NO_CACHE="${_OVR_NO_CACHE:-${NO_CACHE:-0}}"
+GEN="${_OVR_GEN:-${GEN:-test test_mv}}"
+BEAM="${_OVR_BEAM:-${BEAM:-10}}"
 EXTRA_IN="${_OVR_EXTRA:-}"
-WAIT_TIMEOUT_H="${_OVR_WAIT:-12}"
+WAIT_TIMEOUT_H="${_OVR_WAIT:-${WAIT_TIMEOUT_H:-12}}"
 _OVR_DATA="${_OVR_DATA:-}"
 unset _OVR_REPO _OVR_WORK _OVR_EXP _OVR_CKPT _OVR_MAX_UPDATE _OVR_STOP_HOURS \
       _OVR_NO_CACHE _OVR_GEN _OVR_BEAM _OVR_EXTRA _OVR_WAIT
 CACHE="${WORK}/frame_cache"
-MAX_UPDATE="${MAX_UPDATE:-8000}"
-STOP_HOURS="${STOP_HOURS:-4}"
-NO_CACHE="${NO_CACHE:-0}"
-WAIT_TIMEOUT_H="${WAIT_TIMEOUT_H:-12}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -105,7 +106,10 @@ _complete() {
 }
 
 while true; do
-  n_video=$(find "${WORK}/video" -type f 2>/dev/null | wc -l)
+  # 只数"真正的" ROI 产物：align_mouth.py 用 `<fid>.mp4.tmp.mp4` 做原子发布的中间
+  # 文件，被 kill 时可能残留；直接 `find -type f` 会把它们也算成已完成样本，
+  # 于是"齐备"判据被虚高的计数骗过去。
+  n_video=$(find "${WORK}/video" -type f -name '*.mp4' ! -name '*.tmp.mp4' 2>/dev/null | wc -l)
   if [[ "${n_video}" -ge "${need}" && "${need}" -gt 0 ]] && _complete; then
     log "预处理完成：video=${n_video} / ${need}，data/{train,valid,test}.tsv + dict.wrd.txt 齐备"
     break
@@ -239,6 +243,16 @@ log "==== 4/4 解码 ===="
 decode_rc=0
 for g in ${GEN}; do
   log "---- 解码 ${g} ----"
+  # ★ 解码前先清掉这个口径目录里的旧结果。
+  #   `wer.<哈希>` 的哈希只由 cfg.generation 决定（beam/max_len/lenpen/lm_weight，
+  #   见 infer_s2s.py），**不含 checkpoint、不含 gen_subset**。所以换个 BEAM 再跑
+  #   （例如先按官方 BEAM=50 跑一遍、再按交付设置 BEAM=10 跑一遍），
+  #   两条 wer.* 会同时留在 decode_test/ 里，而下面会把**所有** wer.* 都打印出来，
+  #   于是"这一次的结果"里混着上一次的 WER——和已经修过的"复用旧 checkpoint 报旧 WER"
+  #   是同一类坑。删掉旧文件后，目录里剩下的必然是本次产出。
+  if [[ -d "${EXP}/decode_${g}" ]]; then
+    rm -f "${EXP}/decode_${g}"/wer.* "${EXP}/decode_${g}"/hypo-*.json
+  fi
   BEAM="${BEAM}" bash scripts/run_finetune.sh test "${BEST}" "${g}"
   rc=$?
   if [[ "${rc}" -ne 0 ]]; then

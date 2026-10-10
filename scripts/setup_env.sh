@@ -28,14 +28,21 @@ python -c "import sys; print('executable:', sys.executable)"
 if [[ "${CONDA_DEFAULT_ENV:-}" != "avhubert" ]]; then
   echo "⚠️  当前 conda 环境是 '${CONDA_DEFAULT_ENV:-<无>}'，建议先 conda activate avhubert"
 fi
-# Python 版本是**承重**的：fairseq 这个 commit 只兼容 3.8–3.10，而 3.12 会直接
-# 在 dataclass 定义处报 "mutable default ... is not allowed"。原来只警告环境名，
-# 不校验版本，于是装到一半才失败（而且报错信息看着像 fairseq 的问题）。
-if ! python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 8) else 1)'; then
-  echo "错误：本项目的环境固定为 Python 3.8（environment.yml 里已钉死），" >&2
-  echo "      当前是 $(python -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')。" >&2
-  echo "      请 conda env create -f environment.yml && conda activate avhubert 后重试。" >&2
+# Python 版本是**承重**的：fairseq 这个 commit 只兼容 3.8–3.10（3.11+ 会直接在
+# dataclass 定义处报 "mutable default ... is not allowed"）。原来只警告环境名、
+# 不校验版本，于是装到一半才失败（而且报错看着像 fairseq 自己的问题）。
+# 注意范围取 **3.8–3.10**：README §4 就是这么写的，environment.yml 只是把本项目
+# 实测过的 3.8 钉成默认值——这里只拦真正跑不起来的版本。
+if ! python -c 'import sys; sys.exit(0 if (3, 8) <= sys.version_info[:2] <= (3, 10) else 1)'; then
+  _pyv="$(python -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
+  echo "错误：fairseq 这个 commit 只支持 Python 3.8–3.10，当前是 ${_pyv}。" >&2
+  echo "      请 conda env create -f environment.yml && conda activate avhubert 后重试" >&2
+  echo "      （environment.yml 里钉的是本项目实测过的 3.8）。" >&2
   exit 1
+fi
+if ! python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 8) else 1)'; then
+  echo "⚠️  当前不是 environment.yml 里钉的 3.8，而是 $(python -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')。"
+  echo "    3.9/3.10 理论上可用，但本项目只在 3.8 上实测过，遇到怪问题请换回 3.8。"
 fi
 
 log "1. 安装 av_hubert 的 pip 依赖"

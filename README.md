@@ -23,6 +23,75 @@
   后半程解冻编码器），因此 52.97% 应理解为"算力受限下的结果"，不是方法上限；
   提升路径见 `results/02_微调与解码/配置与结果.md` §6。
 
+## 0. 拿到这份代码后怎么复现（先看这一节）
+
+**不能 clone 完直接开跑**——还差 4 项外部输入和 2 条硬约束。下面这一节把它们一次说清，
+不必再翻后面 600 行。
+
+### 0.1 需要自己准备的 4 样东西
+
+| # | 需要什么 | 怎么拿到 | 本仓库里有吗 |
+| --- | --- | --- | --- |
+| 1 | **LRS2 main 数据集**（约 6.9 GB / 48,164 条 clip） | <https://aistudio.baidu.com/datasetdetail/132643/0>（百度 AI Studio，需登录）。**只下 main 部分，不要下完整版 LRS2** | ❌ 未包含（体积原因） |
+| 2 | **数据划分列表** `lrs2_datalist/{train,val,test}.txt` | ⚠️ **这是题方附件，本仓库未包含**（约 1.2 MB：`train.txt` 45,839 行、`val.txt` 1,082 行、`test.txt` 1,243 行且带 `NF`/`MV` 第二列）。需从发放方索取 | ❌ **未包含，这是唯一的硬缺口** |
+| 3 | **预训练权重** `base_vox_iter4.pt`（1.18 GB） | 官方地址，见 §0.3 的命令 | ❌ 已 gitignore（可重新下载） |
+| 4 | **dlib 模型 + 参考平均脸** | 一条命令自动下载：`bash scripts/fetch_dlib_models.sh "$DLIB"` | ❌ 有下载脚本 |
+
+> 为什么第 2 项是硬缺口：没有那三个列表就无法确定哪 45,839 条是 train、哪 1,243 条是 test，
+> 也无法复现 `test_mv` 那 246 条（`MV`/`NF` 标签只存在于 `test.txt` 的第二列），
+> **因此复现不出报告里的两个 WER**。
+
+### 0.2 两条硬约束（不满足就别折腾了）
+
+| 约束 | 说明 |
+| --- | --- |
+| **Python 3.8**（3.8–3.10 可用，3.11+ 不行） | fairseq 这个 pinned commit 在 3.11+ 会直接在 dataclass 定义处报 `mutable default ... is not allowed`。`environment.yml` 已把 3.8 钉死 |
+| **GPU 算力 `sm_XX ≤ sm_86`** | ✅ 可用：RTX 3090(sm_86) / A100(sm_80) / RTX 2080 Ti(sm_75) / V100(sm_70)。❌ **不可用**：RTX 4090(sm_89) / H100(sm_90) / 50 系(sm_120) —— `torch 1.13.1+cu117` 的预编译包架构列表最高只到 sm_86。租机前先跑 `python scripts/check_gpu_compat.py` 验证 |
+
+> ⚠️ 「CUDA 版本」和「算力 sm_XX」是两回事：驱动够新只解决前者，算力不在列表里 kernel 照样起不来。
+
+### 0.3 四条命令
+
+```bash
+# ① 取代码 + 装环境（Python 3.8）
+git clone https://github.com/Qyj-200610/av_hubert_train.git
+cd av_hubert_train
+conda env create -f environment.yml && conda activate avhubert
+bash scripts/setup_env.sh                       # 编译 fairseq 扩展 + 安装 avhubert
+
+# ② 配置路径：复制模板，按注释改成自己的（数据/列表/dlib/work 等）
+cp scripts/avh_env.example.sh ~/avh_env.sh
+vi ~/avh_env.sh                                 # 用你习惯的编辑器，注意别写 $EDITOR：
+                                                # 变量为空时会变成"执行这个文件"
+source ~/avh_env.sh                             # 之后所有脚本都会自己读这些变量
+
+# ③ 下 dlib 模型 + 预训练权重
+bash scripts/fetch_dlib_models.sh "$DLIB"
+mkdir -p pretrained && wget -O pretrained/base_vox_iter4.pt \
+  https://dl.fbaipublicfiles.com/avhubert/model/lrs3_vox/clean-pretrain/base_vox_iter4.pt
+
+# ④ 先冒烟（约 5 分钟，验证整条链路），再全量复跑
+bash scripts/run_reproduce.sh smoke
+bash scripts/run_reproduce.sh full              # 结束时打印 test / test_mv 的 WER
+```
+
+脚本也支持直接传环境变量覆盖（不写模板文件也行）：
+`LRS2_ROOT=... DATALIST=... WORK=... DLIB=... bash scripts/run_reproduce.sh full`
+
+### 0.4 能复现出"同一个数字"吗——要说实话
+
+| 环节 | 是否可复现 |
+| --- | --- |
+| **解码（评测本身）** | ✅ **可确定复现**。解码不含采样（beam search + `lm_weight=0`），同一份 checkpoint 与同一份数据重解码会得到相同的逐句假设。仓库里的 `results/04_原始产物/wer.*` 与 `hypo_*.json` 可以**直接核验** 52.97% = 3528/6660，**不必重跑**（已实测：用自写编辑距离从 `hypo_test.json` 重算，与解码器报告的 52.972973% **逐位一致**） |
+| **重新训练** | ❌ **不会逐位一致**。`image_aug: true` 含随机裁剪/翻转；`num_workers > 0` 时各 worker 的随机序列与调度有关，换一台核数不同的机器序列就变了；cuDNN 默认也非确定性内核（fairseq 未开 `torch.use_deterministic_algorithms`）。seed 虽固定（1337）但挡不住这两点 |
+
+**所以预期是**：重跑得到的 WER 与 **52.97% 相差零点几到一两个百分点**，而不是完全相同。
+
+另外：微调后的 checkpoint（1.92 GB）**未随仓库提供**，因此别人无法重解码；
+要验证那个数，目前靠仓库里已带的原始产物（WER 文件 + 逐句假设 + 训练日志）。
+
+---
+
 ## 1. 当前进度
 
 | 项目 | 状态 |

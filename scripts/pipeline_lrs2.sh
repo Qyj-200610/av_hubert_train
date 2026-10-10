@@ -47,6 +47,13 @@ PREP="${REPO_ROOT}/avhubert/preparation"
 : "${WORK:?请先 export WORK=<工作目录>}"
 : "${FFMPEG:?请先 export FFMPEG=<ffmpeg 可执行文件路径>}"
 : "${NSHARD:=8}"
+# NSHARD 必须是正整数：`:=` 只在"未设置/为空"时赋值，所以 NSHARD=0 会原样留下，
+# 于是 run_ranks_parallel 启动 **0 个 rank**、失败数 0，第 2/3/4 步"全部成功"
+# 却什么都没做——真正的报错要到第 6 步才以"长度不一致"的形式出现，极难定位。
+if ! [[ "${NSHARD}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "错误：NSHARD 必须是正整数（当前：'${NSHARD}'）。分片数应为 CPU 配额大小，例如 NSHARD=8。" >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # 模态：video（默认） | av
@@ -98,7 +105,11 @@ MEAN_FACE="${DLIB}/20words_mean_face.npy"
 check_disk_space() {
   local target="$1"
   local avail_gb
-  avail_gb=$(df -BG --output=avail "${target}" 2>/dev/null | tail -1 | tr -dc '0-9')
+  # 注意结尾的 `|| true`：本脚本是 `set -euo pipefail`，df 一旦失败
+  # （老版本 coreutils 不认 `--output`、路径不存在等）赋值就是非 0 状态，
+  # 整条流水线会**在这里直接中止**，下面那句"跳过检查"的优雅降级永远不会执行
+  # （同理还有后面的 ${hy_gb:-未知}）。
+  avail_gb=$(df -BG --output=avail "${target}" 2>/dev/null | tail -1 | tr -dc '0-9') || true
   if [[ -z "${avail_gb}" ]]; then
     echo "警告：无法读取 ${target} 的可用空间，跳过检查"
     return 0
@@ -139,7 +150,7 @@ EOF
 
 # 前置检查 2：大容量盘提示（恒源云特有）
 if [[ -d /hy-tmp ]]; then
-  hy_gb=$(df -BG --output=avail /hy-tmp 2>/dev/null | tail -1 | tr -dc '0-9')
+  hy_gb=$(df -BG --output=avail /hy-tmp 2>/dev/null | tail -1 | tr -dc '0-9') || true
   echo "检测到恒源云实例：/hy-tmp 剩余 ${hy_gb:-未知} GB"
   case "${WORK}" in
     /hy-tmp/*) : ;;
@@ -170,7 +181,7 @@ step_prepare() {
     --datalist  "${DATALIST}" \
     --work-dir  "${WORK}" \
     --layout    "${LAYOUT:-flat}" \
-    "${limit_args[@]}"
+    ${limit_args[@]+"${limit_args[@]}"}
   echo "总条数: $(wc -l < "${WORK}/file.list")"
   echo "fid 样例: $(head -1 "${WORK}/file.list")"
 }
@@ -380,6 +391,15 @@ case "${1:-all}" in
 
     log "step 3/6  并行检测人脸关键点（${NSHARD} 个 rank）"
     run_ranks_parallel step_landmark
+
+    # 清掉上一次被 kill 时残留的原子发布中间文件（align_mouth.py 写 `<fid>.mp4.tmp.mp4`
+    # 再用 os.replace 改名）。**必须在这里清、不能在 step_mouth 里清**：step_mouth 是
+    # 并行 rank，在函数内清会删掉别的 rank 正在写的临时文件。这里还没启动任何 rank，安全。
+    # ⚠ 必须用 find 而不是 `rm -f "${WORK}"/video/*.tmp.mp4`：
+    #   fid 形如 `<video_id>/<clip_id>`，所以 ROI 是**嵌套**目录
+    #   （`video/5535415699068794046/00001.mp4`），而 shell 的 `*` 不跨 `/`——
+    #   那样写一条都匹配不到，等于死代码（已实测：2 个残留文件纹丝不动）。
+    find "${WORK}/video" -type f -name '*.tmp.mp4' -delete 2>/dev/null || true
 
     log "step 4/6  并行裁切唇部 ROI（${NSHARD} 个 rank）"
     run_ranks_parallel step_mouth

@@ -47,6 +47,32 @@ def read_lines(path):
         return [ln.strip() for ln in f if ln.strip()]
 
 
+def atomic_write_text(path, body):
+    """先写 .tmp、内容写完后用 os.replace 原子发布。
+
+    为什么必须这样：manifest 是训练的直接输入，而本步骤可能跑在主循环之外
+    （`lrs2_manifest.py` 单独调用），被 kill / 磁盘满时会留下**半截 tsv 或 wrd**。
+    下游 `finalize_and_train.sh` 判"预处理完成"只看文件存不存在，于是半个
+    manifest 也能带着进训练；而 `dict.wrd.txt` 被截断更危险——词表少几个 token
+    会让 WER 变成接近 100% 却不报错。
+    改动与 `detect_landmark.py` / `align_mouth.py` 里已经用过的手法一致。
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
+            body(fo)
+            fo.flush()
+            os.fsync(fo.fileno())
+        os.replace(tmp, path)      # 原子发布：要么没有，要么完整
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="生成 AV-HuBERT fine-tune 用的 LRS2 数据目录",
@@ -90,6 +116,24 @@ def main():
     if not (len(fids) == len(labels) == len(nf_audio) == len(nf_video)):
         sys.exit("错误：file.list(%d) / label.list(%d) / nframes.audio(%d) / nframes.video(%d) 长度不一致"
                  % (len(fids), len(labels), len(nf_audio), len(nf_video)))
+
+    # 内容校验：原来只检查了**长度**，没检查过内容。nframes.video 里一旦出现
+    # 空行 / 非整数 / 0，就会在 write_split 里以 ValueError 的形式炸出来，
+    # 报错信息完全指不到病因（而且那时 tsv 已经写了一部分）。
+    # 这两列的含义：视频帧数 = ROI mp4 的实际帧数（下游用它做样本过滤与分批），
+    # 音频帧数在纯视觉模式下是 0 占位，所以**只对视频列要求为正整数**。
+    for i, v in enumerate(nf_video):
+        try:
+            if int(v) <= 0:
+                raise ValueError(v)
+        except (TypeError, ValueError):
+            sys.exit("错误：nframes.video 第 %d 行不是正整数（%r）。该文件可能被截断或写坏，"
+                     "请重跑流水线第 5 步（count_frames）。" % (i + 1, v))
+    for i, v in enumerate(nf_audio):
+        try:
+            int(v)
+        except (TypeError, ValueError):
+            sys.exit("错误：nframes.audio 第 %d 行不是整数（%r）。" % (i + 1, v))
 
     audio_dir = os.path.join(work_dir, "audio")
     video_dir = os.path.join(work_dir, "video")
@@ -201,7 +245,8 @@ def main():
     def write_split(name, indices):
         tsv_path = os.path.join(out_dir, "%s.tsv" % name)
         wrd_path = os.path.join(out_dir, "%s.wrd" % name)
-        with open(tsv_path, "w", encoding="utf-8") as fo:
+
+        def _body_tsv(fo):
             fo.write("/\n")  # 首行是 root（load_audio_visual 会跳过它）
             for i in indices:
                 fid = fids[i]
@@ -212,9 +257,13 @@ def main():
                     nf_video[i],   # items[-2] -> 视频帧数
                     nf_audio[i],   # items[-1] -> 音频帧数
                 ]) + "\n")
-        with open(wrd_path, "w", encoding="utf-8") as fo:
+
+        def _body_wrd(fo):
             for i in indices:
                 fo.write("%s\n" % labels[i])
+
+        atomic_write_text(tsv_path, _body_tsv)
+        atomic_write_text(wrd_path, _body_wrd)
         dur_h = sum(int(nf_video[i]) for i in indices) / 25.0 / 3600.0
         print("  %-6s %6d 条  -> %s  (约 %.2f 小时)" % (name, len(indices), tsv_path, dur_h))
         return len(indices)
@@ -224,8 +273,11 @@ def main():
         write_split(fname, buckets[bucket])
 
     # ---------- 词典 ----------
+    # 同样走"临时文件 + 原子改名"：copyfile 被打断会留下截断的词表
     dict_path = os.path.join(out_dir, "dict.wrd.txt")
-    shutil.copyfile(vocab_path, dict_path)
+    tmp_dict = dict_path + ".tmp"
+    shutil.copyfile(vocab_path, tmp_dict)
+    os.replace(tmp_dict, dict_path)
     print("  词典   -> %s" % dict_path)
 
     # ---------- 可选：test 的 MV 子集（分口径汇报用） ----------
@@ -247,10 +299,11 @@ def main():
             mv_idx = [i for i in buckets["test"]
                       if tags.get(norm(fids[i]).rsplit(".", 1)[0], "") == "MV"]
             if mv_idx:
-                with open(os.path.join(out_dir, "test_mv.wrd"), "w", encoding="utf-8") as fo:
+                def _body_mv_wrd(fo):
                     for i in mv_idx:
                         fo.write("%s\n" % labels[i])
-                with open(os.path.join(out_dir, "test_mv.tsv"), "w", encoding="utf-8") as fo:
+
+                def _body_mv_tsv(fo):
                     fo.write("/\n")
                     for i in mv_idx:
                         fid = fids[i]
@@ -260,6 +313,9 @@ def main():
                             os.path.abspath(os.path.join(audio_dir, fid + ".wav")),
                             nf_video[i], nf_audio[i],
                         ]) + "\n")
+
+                atomic_write_text(os.path.join(out_dir, "test_mv.wrd"), _body_mv_wrd)
+                atomic_write_text(os.path.join(out_dir, "test_mv.tsv"), _body_mv_tsv)
                 print("  MV 子集 %5d 条  -> %s" % (len(mv_idx), os.path.join(out_dir, "test_mv.tsv")))
 
     print()
